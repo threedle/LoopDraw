@@ -1,0 +1,37 @@
+# To be changed depending on your test / setup.
+# Running inference.py requires --mode test, but loads the training set
+# for ground-truth shape viewing in the inference console.
+# If you'd like to load the test set for this purpose instead, uncomment
+# the --load_test_set_for_inference line. (The mean and std used will still be
+# drawn from the train set in the same dataroot.)
+
+--dataroot datasets/shapenet-sofas/ 
+--save_dir checkpoints/shapenet-sofas-0.02KL-10-24/
+--mode test
+--load_epoch -1
+# --load_test_set_for_inference
+
+
+# architecture options
+--lr 0.00007 
+--niter 71 
+--niter_decay 7230 
+--enc_kl_weight 0.02 
+--enc_kl_min 0.1 
+--loop_repr_type fixed-res-polyline 
+--batch_size 16 
+--latent_size 64 
+--architecture transformer 
+--enc_transformer_d_model 512 
+--enc_transformer_n_layers 8 
+--enc_transformer_n_heads 8 
+--enc_transformer_ffwd_size 768 
+--dec_transformer_d_model 512 
+--dec_transformer_n_layers 8 
+--dec_transformer_n_heads 8 
+--dec_transformer_ffwd_size 768 
+--enc_fc_hidden_sizes 128 128 
+--dec_fc_hidden_sizes 128 128 
+--reco_loss_type l2 
+--transformer_arch_version 1 
+--use_eos_token True

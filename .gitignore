@@ -1,0 +1,20 @@
+# folders
+loopcnn-code
+notes
+unused
+checkpoints
+datasets
+
+# files
+*.ini
+*.pyc
+*.obj
+*.ply
+*.tgz
+*.zip
+*.png
+*.txt
+*.pth
+
+# unignore the optfile.txt files
+!*optfile.txt
