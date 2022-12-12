@@ -1,6 +1,8 @@
 # LoopDraw: a Loop-Based Autoregressive Model for Shape Synthesis and Editing
 *Nam Anh Dinh, Haochen Wang, Greg Shakhnarovich, Rana Hanocka*
 
+**[arXiv](https://arxiv.org/abs/2212.04981) | [project page](https://threedle.github.io/LoopDraw/)**
+
 ![teaser](https://threedle.github.io/LoopDraw/l_teaser.png)
 
 
