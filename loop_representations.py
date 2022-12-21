@@ -1047,7 +1047,7 @@ def load_loop_repr_from_mesh(fname, planes, reprtype, repr_options=None,
     all_ellipse_points = None
     for viz_i, plane in enumerate(planes):
         try:
-            mesh_slice = get_loops.MeshOneSlice(plane, hemesh_or_fname=fname)
+            mesh_slice = get_loops.MeshOneSlice(plane, mesh_fname=fname)
         except Exception as e:
             thlog.err(f"[load_loop_repr_from_mesh] error in this slice plane:\n{repr(e)}")
             if throw_on_bad_slice_plane:
