@@ -1,4 +1,5 @@
 import numpy as np
+import os
 
 # color constants for polyscope consistent pics
 PS_COLOR_SURFACE_MESH = (74/255, 161/255, 199/255)
