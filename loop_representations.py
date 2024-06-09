@@ -1,8 +1,9 @@
 # module for extracting various loop representations for use as input and output
 # formats for models to receive/predict
-
+from typing import Tuple, Optional
 import numpy as np
-np.warnings.filterwarnings('error', category=np.VisibleDeprecationWarning)
+import warnings
+warnings.filterwarnings('error', category=np.VisibleDeprecationWarning)
 
 import polyscope as ps
 import os
@@ -96,7 +97,7 @@ def sample_from_list_of_mesh_slices(mesh_slices: list, n_points=50,
         # accumulate all the sub-pointclouds sampled from each slice into
         # a big oriented point cloud we can then later give to the poisson
         # reconstructor
-        if all_points is None:
+        if all_points is None or all_normals is None:
             all_points = sampled_points
             all_normals = sampled_normals
         else:
@@ -148,7 +149,7 @@ def save_npz_file_from_list_of_mesh_slices(mesh_slices: list, fname: str = ""):
     # because all planes have shape (4,3) so we can just list them in an array
     planes = np.array(list(map(lambda ms: ms.plane, mesh_slices)))
     # write out
-    if fname:
+    if fname and loop_pts_packed is not None and loop_conn_arr_packed is not None and loop_segment_normals_packed is not None:
         np.savez_compressed(fname 
             , loop_pts_packed = loop_pts_packed 
             , loop_conn_arr_packed = loop_conn_arr_packed
@@ -312,7 +313,7 @@ def save_contour_file_from_list_of_mesh_slices(mesh_slices: list, fname: str = "
 # template for representations of loosp that may be predicted through a neural
 # network..
 class LoopRepresentation:
-    def get_oriented_point_cloud(self) -> (np.ndarray, np.ndarray):
+    def get_oriented_point_cloud(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         This is responsible for converting the whole sequence of data into
         points and normals for an oriented point cloud, to be fed into the 
@@ -323,8 +324,8 @@ class LoopRepresentation:
 # this should be created/init'd by inference code, after receiving outputs
 # predicted by a model
 class EllipseSingle(LoopRepresentation):
-    def __init__(self, planes: np.array, predicted_sequence: np.array, 
-        segmentize_resolution: int = 30):
+    def __init__(self, planes: np.ndarray, predicted_sequence: np.ndarray, 
+        segmentize_resolution: int = 30, n_points_to_sample_for_point_cloud: int=64):
         """
         This does not support multiple ellipses per mesh level. 
 
@@ -574,11 +575,27 @@ class EllipseMultiple(LoopRepresentation):
             ellipse_params_polar = predicted_step[:-1]
             
             # 2022-09-26: EOS token is 'all zeros params/points, with a planeup flag of 1'
-            if self.use_eos_token and \
-                (np.all(np.isclose(ellipse_params_polar, 0, atol=2e-3)) and levelup):
-                # EOS
-                thlog.debug(f"hit EOS token at plane #{current_plane_i}; stopping")
-                break
+            if self.use_eos_token and current_plane_i >= round(0.6*self.n_planes):
+                if self.run_in_fixed_resolution_polylines_mode:
+                    # crazy heuristic: distance to centroid of loop, as well as 
+                    # magnitude of coords
+                    loop_pt_x = ellipse_params_polar[0::2]
+                    loop_pt_y = ellipse_params_polar[1::2]
+                    loop_pts = np.stack((loop_pt_x, loop_pt_y), axis=-1)
+                    avg_loop_pt = np.mean(loop_pts, axis=0)
+                    avg_dist_to_avg_loop_pt = np.mean(np.linalg.norm(loop_pts - avg_loop_pt))
+                    under_threshold_for_EOS = np.isclose(avg_dist_to_avg_loop_pt, 0, atol=2e-2)
+                        # or (np.isclose(np.mean(loop_pts), 0, atol=1e-3) )
+                    if under_threshold_for_EOS:
+                        thlog.info(f"EOS hit conditions: avg_dist_to_avg_loop_pt {avg_dist_to_avg_loop_pt}, mean coord {np.mean(loop_pts)}")
+                else:
+                    under_threshold_for_EOS = np.all(np.isclose(ellipse_params_polar, 0, atol=5e-3))
+
+
+                if (under_threshold_for_EOS and levelup):
+                    # EOS
+                    thlog.debug(f"hit EOS token at plane #{current_plane_i}; stopping. \n {ellipse_params_polar}")
+                    break
 
 
             ### convert the repr data to a points-and-conn representation that
@@ -614,6 +631,8 @@ class EllipseMultiple(LoopRepresentation):
                 vectors_to_average_loop_point = ellipse_sampled_points - average_loop_point
                 distances_to_average_loop_point = np.linalg.norm(vectors_to_average_loop_point, axis=1)
                 mean_distance_to_average_loop_point = np.mean(distances_to_average_loop_point)
+                if mean_distance_to_average_loop_point == 0.:
+                    continue
                 if mean_distance_to_average_loop_point < __MEANDIST_THRESHOLD:
                     ellipse_sampled_points = average_loop_point + \
                         (__EXPAND_FACTOR * vectors_to_average_loop_point * \
@@ -693,6 +712,26 @@ class EllipseMultiple(LoopRepresentation):
 ###############################################################################
 
 
+def sort_loops_by_decreasing_area(mesh_slice: get_loops.MeshOneSlice, change_to_plane_basis, plane_p_in_plane_basis):
+    """ sort disjoint loops in a MeshOneSlice in order of descending area
+    (so that the biggest loop comes first in the sequence, and so on)
+    Modifies the mesh_slice in place but also returns back (a reference to) it.
+    """
+    loop_pts_in_plane_basis = \
+        np.transpose(np.dot(change_to_plane_basis, np.transpose(mesh_slice.loop_pts))) - plane_p_in_plane_basis
+
+    def __calculate_area(loop_conn_arr):
+        loop_pts_in_plane_basis_this_loop = loop_pts_in_plane_basis[loop_conn_arr[:, 0]]
+        return geometry_utils.polygon_area(loop_pts_in_plane_basis_this_loop[:, 0], loop_pts_in_plane_basis_this_loop[:, 1])
+
+    sorted_indices = sorted(list(range((len(mesh_slice.disjoint_loop_conns)))), 
+        key=lambda i: __calculate_area(mesh_slice.disjoint_loop_conns[i]), reverse=True)
+
+    mesh_slice.disjoint_loop_conns = [mesh_slice.disjoint_loop_conns[i] for i in sorted_indices]
+    # mesh_slice.disjoint_loop_lengths = [mesh_slice.disjoint_loop_lengths[i] for i in sorted_indices]
+    return mesh_slice
+
+
 def fixed_resolution_polylines_disjoint_loops(mesh_slice : get_loops.MeshOneSlice,
     fixed_size_sampling_howmany_points: int):
     # (2022/08/07)
@@ -716,6 +755,11 @@ def fixed_resolution_polylines_disjoint_loops(mesh_slice : get_loops.MeshOneSlic
     plane_n, plane_p, onplane_xaxis, onplane_yaxis, plane_basis, \
         change_to_plane_basis, plane_p_in_plane_basis = \
             geometry_utils.extract_useful_data_from_plane(plane)
+    
+    # new 2022-12-20; incorporating this from loopfields idea. Sort loops in
+    # decreasing area
+    mesh_slice = sort_loops_by_decreasing_area(mesh_slice, 
+        change_to_plane_basis, plane_p_in_plane_basis)
 
 
     # this sampling is sampling the segments. For this representation, we also
@@ -1036,9 +1080,9 @@ def load_loop_repr_from_mesh(fname, planes, reprtype, repr_options=None,
     """
     mesh_dir= os.path.dirname(fname)
     mesh_name = os.path.basename(fname)
-    if thlog.guard(VIZ_INFO, needs_polyscope=True):
-        polysoup = utils.PolygonSoup.from_obj(fname)
-        ps.register_surface_mesh("gt", polysoup.vertices, polysoup.indices, color=utils.PS_COLOR_SURFACE_MESH)
+    # if thlog.guard(VIZ_INFO, needs_polyscope=True):
+    #     polysoup = utils.PolygonSoup.from_obj(fname)
+    #     ps.register_surface_mesh("gt", polysoup.vertices, polysoup.indices, color=utils.PS_COLOR_SURFACE_MESH)
     
     all_points = None
     all_normals = None
@@ -1049,7 +1093,7 @@ def load_loop_repr_from_mesh(fname, planes, reprtype, repr_options=None,
         try:
             mesh_slice = get_loops.MeshOneSlice(plane, mesh_fname=fname)
         except Exception as e:
-            thlog.err(f"[load_loop_repr_from_mesh] error in this slice plane:\n{repr(e)}")
+            thlog.err(f"[load_loop_repr_from_mesh] error at slice plane index {viz_i}:\n{repr(e)}")
             if throw_on_bad_slice_plane:
                 thlog.err(f"[load_loop_repr_from_mesh] bad planes are set to be unacceptable. Throwing!")
                 raise e # and don't continue to next planes
@@ -1072,6 +1116,7 @@ def load_loop_repr_from_mesh(fname, planes, reprtype, repr_options=None,
 
         # this sampling is sampling the segments from the real-mesh-slice
         # (and not sampling from ellipses/our own representation)
+        # (only for viewing)
         sampled_points, sampled_normals = \
             get_loops.sample_from_loops_and_normals(mesh_slice, 50)
         if thlog.guard(VIZ_DEBUG, needs_polyscope=True):
@@ -1175,6 +1220,13 @@ def load_loop_repr_from_mesh(fname, planes, reprtype, repr_options=None,
             np.reshape(all_repr_points, (all_repr_points_shape[0] * all_repr_points_shape[1], 3))
         ps.register_point_cloud("ellipses", all_repr_points_to_show)
         ps.show()
+    
+    # only all_repr_data is actually used in training.. the rest are for 
+    # visualizations of the slicing process. 
+    # because the representation may not simply be directly resampled source
+    # slice segments, "all_repr_points" is a point sampling of that
+    # representation (i.e. points sampled from fit curves, ellipses).
+    # but in the Fixed Res Polyline case, it's no different from all_points.
     return all_repr_data, all_points, all_normals, all_repr_points
 
 
@@ -1223,21 +1275,77 @@ def get_nice_set_of_slice_planes(
 # these test main functions are  not very nicely written because they're for
 # testing/playground purposes only; lots of duplicate code abound...
 def loop_reprs_test_main():
+    """
+    requires pytorch3d
+    usage: 
+    python loop_representations.py <planespec file> folder|file <dir or single obj file path>
+    """
+    import torch
+    import pytorch3d.loss
+    import pytorch3d.ops
+    import pytorch3d.io
+    import pytorch3d.structures
+    import glob
+
+    def normalize_to_centered_cube_inplace(meshes: pytorch3d.structures.Meshes, cube_side_length: float=1.0):
+        """
+        normalize to a cube of side length cube_side_length centered at origin
+        """
+        bounding_boxes = meshes.get_bounding_boxes()  # (n_meshes, 3, 2)
+        mesh_to_verts_packed_first_idx = meshes.mesh_to_verts_packed_first_idx()
+        
+        bounding_boxes_packed = bounding_boxes[meshes.verts_packed_to_mesh_idx()]  # (sum of all vertex counts, 3, 2)
+        min_coords_packed = bounding_boxes_packed[:, :, 0]
+        max_coords_packed = bounding_boxes_packed[:, :, 1]
+        extent_packed, _ = (max_coords_packed - min_coords_packed).max(dim=-1)
+        
+        scale_per_mesh = cube_side_length / extent_packed[mesh_to_verts_packed_first_idx]  # (n_meshes, )
+        center_packed = (min_coords_packed + max_coords_packed) / 2       # (sum of all vertex counts, 3)
+
+        # normalize in-place
+        meshes.offset_verts_(-center_packed)
+        meshes.scale_verts_(scale_per_mesh)
+
+
     loop_repr_to_use = LOOP_REPR_FIXED_RES_POLYLINE
     throw_on_fail = True
     do_poisson_reconstruction = True
     throw_on_bad_slice_plane = False
+    use_eos_token = True
+    thlog.set_levels(LOG_INFO, VIZ_DEBUG)
+    
+    reconstructed_save_dir = None
 
-
-    # mesh_dir= "../raw-3d-data/paint3d-1loop1plane/"
-    # mesh_name = "celloshort-125f.obj"
     thlog.init_polyscope()
     # first argument is the planespec file
     scan_dir, num_slices, min_coord, max_coord = utils.read_planespec_file(sys.argv[1])
     planes = get_nice_set_of_slice_planes(num_slices, min_coord=min_coord, max_coord=max_coord, scan_in_direction_xyz=scan_dir)
     # bad_meshes = []
     good_meshes = []
-    for fname in sys.argv[2:]:
+
+    mode = sys.argv[2]
+    if mode == "folder":
+        fnames = sorted(glob.glob(os.path.join(sys.argv[3], "*.obj")))
+        n_shapes = int(sys.argv[4])
+    else:
+        fnames = [sys.argv[3]]
+        n_shapes = 1
+
+    
+    if n_shapes > 0:
+        fnames = fnames[:n_shapes]
+    else:
+        # specify n_shapes argument to be negative to use all obj files in the
+        # specified dir in sys.argv[2]
+        n_shapes = len(fnames)
+    
+    
+    pytorch3d_gt_meshes = pytorch3d.io.load_objs_as_meshes(fnames, load_textures=False)
+    normalize_to_centered_cube_inplace(pytorch3d_gt_meshes)
+
+    chamfer_losses = np.zeros(n_shapes, dtype=float)
+    good_meshes_mask = np.zeros(n_shapes, dtype=bool)
+    for i, (fname, pytorch3d_gt_mesh) in enumerate(zip(fnames, pytorch3d_gt_meshes)):
         ps.remove_all_structures()
         mesh_dir = os.path.dirname(fname)
         mesh_name = os.path.basename(fname)
@@ -1246,7 +1354,8 @@ def loop_reprs_test_main():
         # now we make the mesh_slice and stuff from there    
         try:
             repr_data, slice_points, slice_normals, repr_sampled_points = \
-                load_loop_repr_from_mesh(fname, planes, loop_repr_to_use, repr_options=32, throw_on_bad_slice_plane=throw_on_bad_slice_plane)
+                load_loop_repr_from_mesh(fname, planes, loop_repr_to_use, 
+                repr_options=32, throw_on_bad_slice_plane=throw_on_bad_slice_plane, append_endofsequence_timestep=use_eos_token)
         except Exception as e:
             if isinstance(e, KeyboardInterrupt):
                 raise KeyboardInterrupt()
@@ -1260,16 +1369,61 @@ def loop_reprs_test_main():
         thlog.debug(f"repr data: first and rest \n {repr_data[0]} all: \n {repr_data}")
         thlog.info(f"{mesh_name}: There are {len(repr_data)} time steps in the loop sequence data; loop data has shape {repr_data.shape}")
         
-        if do_poisson_reconstruction and thlog.guard(VIZ_DEBUG, needs_polyscope=True):
-            reco_vertices, reco_faces = meshlab_poisson_reco.do_poisson_reco(
-                slice_points, slice_normals, depth=6)
-            ps.register_surface_mesh("reconstructed", reco_vertices, reco_faces)
+        if do_poisson_reconstruction:
+            # this is going thru the machinery in the LoopRepresentation classes
+            # (EllipseMultiple etc) above, same as what is run at inference to
+            # recover point cloud from loops.
+            # specifically, from the 32-segment loop representation, we
+            # - distribute (by loop length) 48 points across all loops on each slice
+            # - any loop that has <24 points assigned by above step gets 24 instead
+            # - normals are estimated using the original 32-segment representation
+            # and then smoothed.
+            # - cap points are added for closed reconstruction
+            # - very small loops are made into a circle
+            loop_repr_object = EllipseMultiple(planes, repr_data,
+                segmentize_resolution=64, n_points_to_sample_for_point_cloud=48,
+                run_in_fixed_resolution_polylines_mode=True,
+                min_n_points_per_loop=24,
+                use_eos_token = use_eos_token,
+                postprocessing_heuristics=
+                    [ 'smooth-normals']
+                )
+            all_points, all_normals = loop_repr_object.get_oriented_point_cloud()
+            reco_vertices, reco_faces = meshlab_poisson_reco.do_poisson_reco(all_points, all_normals, save_filename=None if not reconstructed_save_dir else os.path.join(reconstructed_save_dir, mesh_name + ".obj"))
             
-            ps.show()
+            # bring this to pytorch3d and compare chamfer
+            pytorch3d_reco_mesh = pytorch3d.structures.Meshes([torch.from_numpy(reco_vertices).float()], [torch.from_numpy(reco_faces)])
+            normalize_to_centered_cube_inplace(pytorch3d_reco_mesh)
+            if thlog.guard(VIZ_DEBUG, needs_polyscope=True):
+                ps.register_surface_mesh("reconstructed", pytorch3d_reco_mesh.verts_packed().cpu().detach().double().numpy(), pytorch3d_reco_mesh.faces_packed().cpu().detach().numpy(), color=utils.PS_COLOR_SURFACE_MESH)
+                ps.register_surface_mesh("gt", pytorch3d_gt_mesh.verts_packed().cpu().detach().double().numpy(), pytorch3d_gt_mesh.faces_packed().cpu().detach().numpy())
+                ps.show()
+                for viz_i in range(132): # arbitrary number.... for viz purposes
+                    try:
+                        ps.get_curve_network(f"cunet{viz_i}").set_enabled(False)
+                    except:
+                        pass
+                    try:
+                        ps.get_point_cloud(f"ellipses").set_enabled(False)
+                    except:
+                        pass
+                ps.show()
+
+
+            gt_sampled_pcloud = pytorch3d.ops.sample_points_from_meshes(pytorch3d_gt_mesh)
+            reco_sampled_pcloud = pytorch3d.ops.sample_points_from_meshes(pytorch3d_reco_mesh)
+            chamfer_loss, _ = pytorch3d.loss.chamfer_distance(gt_sampled_pcloud, reco_sampled_pcloud)
+            chamfer_loss_val = chamfer_loss.item()
+            thlog.info(f"mesh {os.path.basename(fname)}: {chamfer_loss_val}")
+            chamfer_losses[i] = chamfer_loss_val
+            good_meshes_mask[i] = True
+
 
     thlog.info(f"good meshes: ")
     for name in good_meshes:
         print(name)    
+    
+    thlog.info(f"avg reconstruction loss (gt loops, poisson reco, vs gt mesh) chamfer distance: {chamfer_losses[good_meshes_mask].mean()} (avg out of {good_meshes_mask.sum()} good sliceable meshes)")
 
 if __name__ ==  "__main__":
     loop_reprs_test_main()

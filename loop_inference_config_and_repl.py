@@ -1,4 +1,9 @@
+from typing import Optional
 import os
+try:
+    import readline
+except:
+    print("unable to import readline, CLI history won't be available")
 import importlib
 import numpy as np
 import loop_inference_intervention_func
@@ -6,14 +11,14 @@ import loop_inference_intervention_func
 
 class LoopInferenceSettings:
     def __init__(self):
-        self.JUST_VIEW_GT = False 
+        self.JUST_VIEW_GT: bool = False 
         """ 
         specify True to override all other inference options and just view the
         ground truth data item with index specified in TEST_DATA_ITEM below.
         Overrides all the other options except for TEST_DATA_ITEM which is used.
         """
 
-        self.JUST_VIEW_THIS_SEQUENCE_DATA = None
+        self.JUST_VIEW_THIS_SEQUENCE_DATA: Optional[np.ndarray] = None
         """
         specify an np.array of shape (n_loops, n_features) describing a single loop
         in order to view it in isolation, with no reconstruction etc. Overrides
@@ -22,7 +27,7 @@ class LoopInferenceSettings:
         """
 
         # inference options;
-        self.DOING_RECO_TEST = False
+        self.DOING_RECO_TEST: bool = False
         """
         Set to True in order to run reconstruction tests; if this is True, must
         provide values for RECO_TEST_AUTOREGRESSIVE and TEST_DATA_ITEM.
@@ -42,7 +47,7 @@ class LoopInferenceSettings:
         """
         # reconstruction options
 
-        self.RECO_WITH_NO_SAMPLING_USING_SIGMA = True
+        self.RECO_WITH_NO_SAMPLING_USING_SIGMA: bool = True
         """
         if RECO_WITH_NO_SAMPLING_USING_SIGMA is True, then only the encoder's
         predicted mu will be returned as the latent vector for use by the
@@ -50,7 +55,7 @@ class LoopInferenceSettings:
         what's messing up reconstruction each new run.
         """
 
-        self.RECO_TEST_AUTOREGRESSIVE = True
+        self.RECO_TEST_AUTOREGRESSIVE: bool = True
         """ 
         If this is False, the model will only ever predict 1 step ahead; each
         previous step is provided by ground truth. Only meaningful if
@@ -59,7 +64,7 @@ class LoopInferenceSettings:
 
 
         # non-reco/sampling options
-        self.DOING_LERP_SAMPLING_TEST = False
+        self.DOING_LERP_SAMPLING_TEST: bool = False
         """
         Set to True in order to see how the model decodes a set of latents that
         lerps from one random vector to another in Normal(0,1). Only works if
@@ -67,31 +72,31 @@ class LoopInferenceSettings:
         """
 
         # these are only relevant if DOING_LERP_SAMPLING_TEST is True.
-        self.LERP_SAMPLING_START_Z = None
-        self.LERP_SAMPLING_END_Z = None
+        self.LERP_SAMPLING_START_Z: Optional[np.ndarray] = None
+        self.LERP_SAMPLING_END_Z: Optional[np.ndarray] = None
 
 
-        self.DECODE_CUSTOM_LATENT = None
+        self.DECODE_CUSTOM_LATENT: Optional[np.ndarray] = None
         """
         If this is not None, the latent z specified here (of shape latent_size)
         will be input as a custom latent code for the model to decode.
         """
 
-        self.N_SAMPLES = 25
+        self.N_SAMPLES: int = 25
         """
         For when DOING_RECO_TEST is False; number of samples to draw from prior
         or interpolate between two random latent codes
         """
 
         #151 #50 is the nice connected handle vase.. # let's use 67
-        self.TEST_DATA_ITEM = 0   
+        self.TEST_DATA_ITEM: int = 0   
         """
         Dataset index for the test item to reconstruct. (Index with respect to a
         dataset with batch size of 1.)
         """
 
 
-        self.DO_LOOP_INTERVENTION_EXPERIMENT = False
+        self.DO_LOOP_INTERVENTION_EXPERIMENT: bool = False
         """
         Specify True in order to apply the 'loop generation intervention
         function' (during autoregressive generation. (see
@@ -99,13 +104,13 @@ class LoopInferenceSettings:
         (this is an 'optional keyword argument' in the 'submit' command.)
         """
 
-        self.SAVE_CONTOUR_AND_OBJ_FILE = False
+        self.SAVE_CONTOUR_AND_OBJ_FILE: bool = False
         """ save as .contour file and meshlab poisson-reconstructed .obj file
         """
 
         # this is not a config option used by run_inference_and_viz, 
         # only used by InferenceREPL for recordkeeping in the queue
-        self.invoking_command = ""
+        self.invoking_command: str = ""
     
     def __str__(self):
         r = ""
@@ -140,7 +145,8 @@ class InferenceREPL:
         self.loop_generation_intervention = \
             loop_inference_intervention_func.loop_generation_intervention
 
-        self.prompt = '\033[96m' + '\033[4m' + 'inference' + '\033[0m' + '> '
+        # \001 and \002 are for readline to know how long the visible prompt is
+        self.prompt = '\001\033[96m' + '\033[4m\002' + 'inference' + '\001\033[0m\002' + '> '
     
     def repl_print(self, msg, is_error=False):
         OKBLUE = '\033[94m'
@@ -491,15 +497,18 @@ class InferenceREPL:
             
         
         elif command == "assign":
-            value_to_store = __read_nparray_option_token(tokens[2], should_be_latent_size=False)
-            # the should_be_latent_size = False because we can store whatever
-            # size np array; the enforcement to be latent_size is up to those
-            # who read the values of stored variables, not the assign function.
-            if value_to_store is None:
-                self.repl_print(f"!! could not read value '{tokens[2]}' to store as ${tokens[1]}", is_error=True)
+            if len(tokens) < 3:
+                self.repl_print(f"!! need latent vector at argument 2")
             else:
-                self.variable_bind(tokens[1], value_to_store)
-        
+                value_to_store = __read_nparray_option_token(tokens[2], should_be_latent_size=False)
+                # the should_be_latent_size = False because we can store whatever
+                # size np array; the enforcement to be latent_size is up to those
+                # who read the values of stored variables, not the assign function.
+                if value_to_store is None:
+                    self.repl_print(f"!! could not read value '{tokens[2]}' to store as ${tokens[1]}", is_error=True)
+                else:
+                    self.variable_bind(tokens[1], value_to_store)
+            
         elif command == "variables":
             if not self.__repl_variable_binds:
                 self.repl_print("No bound variables.")

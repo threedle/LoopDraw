@@ -18,7 +18,7 @@ conda activate loopdraw
 
 #### **Datasets**
 
-The datasets featured in the experiments in the paper can be downloaded [from this Drive folder](https://drive.google.com/drive/folders/1ClVknlE3xf24X3T-2Nt8dVHfQ3XGdpQu?usp=share_link). Each `.tgz` file contains at its top level a `train` and (for the sofas set) a `test` directory.
+The datasets featured in the experiments in the paper can be downloaded [from this Drive folder](https://drive.google.com/drive/folders/1ClVknlE3xf24X3T-2Nt8dVHfQ3XGdpQu?usp=share_link). Each `.tgz` file contains at its top level a `train` and a `test` directory.
 
 Given a `datasets/` directory, extract as follows. For example, after downloading `shapenet-sofas.tgz`:
 ```
@@ -31,15 +31,15 @@ The paths should look like this:
 
 ```
 datasets/
-|- shapenet-sofas/
-   |- train/
-      |- (all .obj files; optional if preprocessed_cache.npz is present)
-      |- planespec.txt
-      |- preprocessed_cache.npz
-   |- test/
-      |- (all .obj files; optional if preprocessed_cache.npz is present)
-      |- planespec.txt
-      |- preprocessed_cache.npz
+╰─ shapenet-sofas/
+   ├─ train/
+   │  ├─ (all .obj files; optional if preprocessed_cache.npz is present)
+   │  ├─ planespec.txt
+   │  ╰─ preprocessed_cache.npz
+   ╰─ test/
+      ├─ (all .obj files; optional if preprocessed_cache.npz is present)
+      ├─ planespec.txt
+      ╰─ preprocessed_cache.npz
 ```
 
 In general, a dataset folder (a dataroot) must be a folder that contains a `train` and optionally a `test` subdirectory. 
@@ -59,9 +59,9 @@ tar xvzf <path to your shapenet-sofas-0.02KL-10-24.tgz>
 And the paths should look like
 ```
 checkpoints/
-|- shapenet-sofas-0.02KL-10-24/
-   |- enclatest_net.pth
-   |- declatest_net.pth
+╰─ shapenet-sofas-0.02KL-10-24/
+   ├─ enclatest_net.pth
+   ╰─ declatest_net.pth
 ```
 A checkpoint save directory must contain those two `.pth` files. When saving files from inference runs, output files will be saved in a folder `inference/` at the same directory level as the `.pth` files.
 

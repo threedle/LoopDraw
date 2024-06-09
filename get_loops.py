@@ -1,10 +1,11 @@
+from typing import Optional, Sequence, Union, List
 import numpy as np
 from scipy.interpolate import interp1d
 import matplotlib.path as pltpath  # for the area-sampling function
 import polyscope as ps
 
 import utils
-from geometry_utils import unit, extract_useful_data_from_plane
+from geometry_utils import unit, extract_useful_data_from_plane, polygon_area
 import meshlab_poisson_reco # has thlog
 import slice_with_pyvista # has the slicer
 from thlog import *
@@ -39,7 +40,7 @@ class MeshOneSlice:
     - predicted_loops: This should be a tuple consisting of
         (loop points, loop connectivity array, loop normals (this may be None))
     """
-    def __init__(self, plane: np.array, mesh_fname=None, predicted_loops=None):
+    def __init__(self, plane: np.ndarray, mesh_fname=None, predicted_loops=None):
         self.from_slicing_real_mesh = False
         self.plane = plane
         assert plane.shape == (4, 3), \
@@ -62,14 +63,15 @@ class MeshOneSlice:
             loop_pts, loop_conn_arr, normals_at_loop_pts = predicted_loops
         else:
             raise ValueError("At least one of hemesh or predicted_loops should be non-None")
-        self.loop_pts = loop_pts
-        self.loop_conn_arr = loop_conn_arr
+        self.loop_pts: np.ndarray = loop_pts
+        self.loop_conn_arr: np.ndarray = loop_conn_arr
         # for caching later when other functions are run (such as the normal
         # estimator)
-        self.disjoint_loop_conns = None
-        self.disjoint_loop_lengths = None
-        self.loop_segment_normals = normals_at_loop_pts
-        self.loop_segment_vectors = None
+        self.disjoint_loop_conns: Optional[Sequence[np.ndarray]] = None
+        self.disjoint_loop_lengths: Optional[Sequence[float]] = None
+        self.loop_segment_normals: Optional[np.ndarray] = normals_at_loop_pts
+        self.loop_segment_vectors: Optional[np.ndarray] = None
+        self.sign_flip_per_loop: Optional[np.ndarray] = None  # for inside-outside information
         # fill in the rest of the arrays
         distinguish_disjoint_loops(self)
     
@@ -133,6 +135,64 @@ def distinguish_disjoint_loops(mesh_slice: MeshOneSlice):
     return mesh_slice
 
 
+def sort_loops_by_decreasing_area(mesh_slice: MeshOneSlice, change_to_plane_basis, plane_p_in_plane_basis):
+    """ sort disjoint loops in a MeshOneSlice in order of descending area
+    (so that the biggest loop comes first in the sequence, and so on)
+    Modifies the mesh_slice in place but also returns back (a reference to) it.
+    """
+    loop_pts_in_plane_basis = \
+        np.transpose(np.dot(change_to_plane_basis, np.transpose(mesh_slice.loop_pts))) - plane_p_in_plane_basis
+
+    assert mesh_slice.disjoint_loop_conns is not None
+    disjoint_loop_conns = mesh_slice.disjoint_loop_conns
+    def __calculate_area(loop_conn_arr) -> float:
+        loop_pts_in_plane_basis_this_loop = loop_pts_in_plane_basis[loop_conn_arr[:, 0]]
+        return polygon_area(loop_pts_in_plane_basis_this_loop[:, 0], loop_pts_in_plane_basis_this_loop[:, 1])
+
+    sorted_indices = sorted(list(range((len(disjoint_loop_conns)))), 
+        key=lambda i: __calculate_area(disjoint_loop_conns[i]), reverse=True)
+
+    mesh_slice.disjoint_loop_conns = [mesh_slice.disjoint_loop_conns[i] for i in sorted_indices]
+    # mesh_slice.disjoint_loop_lengths = [mesh_slice.disjoint_loop_lengths[i] for i in sorted_indices]
+    return mesh_slice, loop_pts_in_plane_basis
+
+
+def calculate_inside_outside_loops(mesh_slice: MeshOneSlice):
+    """
+    populates the field mesh_slice.sign_flip_per_loop, an int array where each
+    value is either 1 or -1 (related to whether the winding number is even or
+    odd, i.e. a loop B completely contained in a loop A gets the inverse of loop
+    A's sign; the outermost loop gets 1)
+    """
+    disjoint_loop_conns = mesh_slice.disjoint_loop_conns
+    assert disjoint_loop_conns is not None
+
+    n_disjoint_loops = len(disjoint_loop_conns)
+    if n_disjoint_loops > 1:
+        # inside-outside check; potentially expensive
+        _, _, _, _, _, change_to_plane_basis, plane_p_in_plane_basis = extract_useful_data_from_plane(mesh_slice.plane)
+        mesh_slice, loop_pts_in_plane_basis = sort_loops_by_decreasing_area(mesh_slice, change_to_plane_basis, plane_p_in_plane_basis)
+        disjoint_loop_conns = mesh_slice.disjoint_loop_conns
+        assert disjoint_loop_conns is not None
+
+        # ^ this loop_pts_in_plane_basis has (N, 3), we chop off the last coord
+        # which should be zero
+        loop_pts_in_2d = loop_pts_in_plane_basis[:, :2]
+        # then for each loop in this sorted mesh slice, check all smaller loops
+        sign_flip_per_loop = np.ones(n_disjoint_loops, dtype=int)
+        loops_as_paths = [pltpath.Path(loop_pts_in_2d[loop_conn[:, 0]], closed=True) for loop_conn in disjoint_loop_conns]
+        
+        for path_i, path in enumerate(loops_as_paths):
+            for smaller_path_i in range(path_i+1, n_disjoint_loops):
+                if path.contains_path(loops_as_paths[smaller_path_i]):
+                    sign_flip_per_loop[smaller_path_i] = -sign_flip_per_loop[smaller_path_i]
+
+        mesh_slice.sign_flip_per_loop = sign_flip_per_loop
+    else:
+        mesh_slice.sign_flip_per_loop = np.array([1], dtype=int)
+    return mesh_slice
+
+
 def estimate_loop_segment_normals_simple(mesh_slice: MeshOneSlice):
     """
     A normal estimation routine. Estimates loop normals based on the slice plane
@@ -154,6 +214,7 @@ def estimate_loop_segment_normals_simple(mesh_slice: MeshOneSlice):
     Changes the following fields in mesh_slice:
     - loop_segment_normals
     """
+    mesh_slice = calculate_inside_outside_loops(mesh_slice)
     plane = mesh_slice.plane
 
     loop_pts = mesh_slice.loop_pts
@@ -161,6 +222,7 @@ def estimate_loop_segment_normals_simple(mesh_slice: MeshOneSlice):
 
     loop_seg_normals = np.zeros_like(loop_pts)
     loop_seg_vectors = mesh_slice.loop_segment_vectors
+    assert loop_seg_vectors is not None
 
     plane_n = plane[0]
     plane_p = plane[1]
@@ -186,8 +248,10 @@ def estimate_loop_segment_normals_simple(mesh_slice: MeshOneSlice):
     # point, and check the sign against the plane normal. Flip the sign of the
     # loops to make that comparison (with the plane normal) be the same sign for
     # all disjoint loops.
-    
-    for loop_conn in mesh_slice.disjoint_loop_conns:
+    assert mesh_slice.disjoint_loop_conns is not None
+    assert mesh_slice.sign_flip_per_loop is not None # for inside-outside info
+    disjoint_loop_conns = mesh_slice.disjoint_loop_conns
+    for loop_conn, sign_flip in zip(disjoint_loop_conns, mesh_slice.sign_flip_per_loop):
         sum_crosses = np.zeros(3)
         for segment in loop_conn:
             curr_i = segment[0]
@@ -199,6 +263,10 @@ def estimate_loop_segment_normals_simple(mesh_slice: MeshOneSlice):
             # flip the sign of all the normals of this loop
             for segment in loop_conn:
                 loop_seg_normals[segment[0]] *= (-1)
+        
+        # finally, flip sign according to inside-outside calculation
+        for segment in loop_conn:
+            loop_seg_normals[segment[0]] *= sign_flip
 
     mesh_slice.loop_segment_normals = loop_seg_normals
     return mesh_slice
@@ -280,11 +348,11 @@ def sample_from_loops_and_normals(mesh_slice: MeshOneSlice, n_points: int,
         disjoint_loop_lengths / np.sum(disjoint_loop_lengths)
     
     if separate_by_disjoint_loops:
-        all_sampled_points = []
-        all_sampled_normals = []
+        all_sampled_points: Union[List[np.ndarray], Optional[np.ndarray]] = []
+        all_sampled_normals: Union[List[np.ndarray], Optional[np.ndarray]] = []
     else:
-        all_sampled_points = None
-        all_sampled_normals = None
+        all_sampled_points: Union[List[np.ndarray], Optional[np.ndarray]] = None
+        all_sampled_normals: Union[List[np.ndarray], Optional[np.ndarray]] = None
 
     for loop_conn_arr, loop_length, proportion in zip(
         disjoint_loop_conns, 
@@ -343,11 +411,11 @@ def sample_from_loops_and_normals(mesh_slice: MeshOneSlice, n_points: int,
             lerpfn_ny(lerpfn_progress),
             lerpfn_nz(lerpfn_progress)
         ))
-        if separate_by_disjoint_loops:
+        if separate_by_disjoint_loops and isinstance(all_sampled_points, list) and isinstance(all_sampled_normals, list):
             all_sampled_points.append(sampled_points_this_loop)
             all_sampled_normals.append(sampled_normals_this_loop)
         else:
-            if all_sampled_points is None:
+            if all_sampled_points is None or all_sampled_normals is None:
                 all_sampled_points = sampled_points_this_loop
                 all_sampled_normals = sampled_normals_this_loop
             else:
@@ -355,10 +423,11 @@ def sample_from_loops_and_normals(mesh_slice: MeshOneSlice, n_points: int,
                     (all_sampled_points, sampled_points_this_loop))
                 all_sampled_normals = np.hstack(
                     (all_sampled_normals, sampled_normals_this_loop))
-    if separate_by_disjoint_loops:
+    if separate_by_disjoint_loops and isinstance(all_sampled_points, list) and isinstance(all_sampled_normals, list):
         return list(map(np.transpose, all_sampled_points)), \
                list(map(np.transpose, all_sampled_normals))
     else:
+        assert isinstance(all_sampled_points, np.ndarray) and isinstance(all_sampled_normals, np.ndarray)
         return np.transpose(all_sampled_points), \
                np.transpose(all_sampled_normals)
 
@@ -387,6 +456,8 @@ def sample_points_to_fill_polygons(mesh_slice: MeshOneSlice, n_bbox_points: int,
     # the loop conn arr of each closed polygon is guaranteed to be in order of
     # vertices around the polygon (and always clockwise), so we can do this
     # (it's guaranteed because of the way distinguish_disjoint_loops is run)
+    assert mesh_slice.disjoint_loop_conns is not None
+    assert mesh_slice.sign_flip_per_loop is not None  # for filtering points inside/outside polygons
     polygons = [loop_pts_in_2d[disjoint_loop_conn[:, 0]] for disjoint_loop_conn in mesh_slice.disjoint_loop_conns]
     
     # find the bounding box for each polygon. (top left corner, bottom right corner)
@@ -403,9 +474,10 @@ def sample_points_to_fill_polygons(mesh_slice: MeshOneSlice, n_bbox_points: int,
     
     # then for each polygon+bbox sample pts, filter these points to only those
     # in the polygon.
+    # account for inside-outside (i.e. only count polygons with a sign of 1)    
     sampled_points_inside_polygons = [
         bbox_pts[pltpath.Path(polygon).contains_points(bbox_pts)]
-        for polygon, bbox_pts in zip(polygons, bbox_sampled_points) ]
+        for polygon, bbox_pts, sign_flip in zip(polygons, bbox_sampled_points, mesh_slice.sign_flip_per_loop) if sign_flip > 0]
     
     # recast these points from the 2D plane basis to 3D world coords
     sampled_points_inside_polygons = [np.transpose(

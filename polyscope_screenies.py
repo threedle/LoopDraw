@@ -1,3 +1,4 @@
+from typing import Optional
 import polyscope as ps
 import sys
 import utils
@@ -22,11 +23,13 @@ from loop_representations import read_mesh_slices_npz_file_for_polyscope
 __TRANSPARENT = True
 __NOGROUND = True
 __SHADOW = True
+__NEGATE_X_AXIS = False
 # Loop highlighting options. Only matters if the meshname.obj has a meshname-slices.npz file
 # in the same location, providing loop sequence information. 
-__HIGHLIGHT_EDITS = [] # a list of loop indices to highlight (e.g. as edited). For example,  list(range(8, 12))
+__HIGHLIGHT_EDITS = [4] # a list of loop indices to highlight (e.g. as edited). For example,  list(range(8, 12))
+__HIGHLIGHT_EXTRA_SPECIAL_EDITS = []
 __HIDE_NON_EDITS = False  # specify this to just hide any curve net that isn't specified in __HIGHLIGHT_EDITS
-__APPEARANCE_ABOVE_EDIT = "color"  # "hide", "color" (uses PS_COLOR_CUNET_ABOVE_EDIT), "unchanged", "flip" (only show loops above edit/highlighted, and hide below)
+__APPEARANCE_ABOVE_EDIT = "unchanged"  # "hide", "color" (uses PS_COLOR_CUNET_ABOVE_EDIT), "unchanged", "flip" (only show loops above edit/highlighted, and hide below)
 
 # draw a rectangle slice plane around the listed loops
 __DRAW_PLANE_AT_LOOP = []
@@ -47,6 +50,7 @@ color_paleyellow = (255/255, 255/255, 145/255)
 color_bababa = (186/255, 186/255, 186/255)
 
 PS_COLOR_CUNET_AT_EDIT = color_red
+PS_COLOR_CUNET_AT_EXTRA_SPECIAL_EDIT = color_blue
 PS_COLOR_CUNET_BELOW_EDIT = utils.PS_COLOR_CURVE_NETWORK
 PS_COLOR_CUNET_ABOVE_EDIT = color_palepink
 PS_MESH_OPACITY_WITH_HIGHLIGHT = 1.0
@@ -79,6 +83,8 @@ def make_fake_plane_mesh(loop_pts, register_ps_slice_plane=False):
         remaining_coords = (0, 2)
     elif normal_direction == 2: # normal is z
         remaining_coords = (0, 1)
+    else:
+        raise ValueError("invalid normal_direction")
 
     # extent of the loop pts, to draw a nice rectangle
     x_max, y_max = tuple(np.max(loop_pts[:, remaining_coords], axis=0))
@@ -167,9 +173,9 @@ def distinguish_disjoint_loops_lite(loop_ptses, loop_conns, loop_seg_normalses):
     return closed_loops
             
 
-def main(current_animation_step: int = None):
+def main(current_animation_step: Optional[int] = None):
     """ current_animation_step is only used in __ANIMATE=True mode.  """
-
+    maybe_negate_x_axis = lambda verts: np.concatenate((-verts[:, [0]], verts[:, 1:]), axis=-1) if __NEGATE_X_AXIS else verts
     obj_fnames = sys.argv[1:]
     do_ps_show = (os.environ.get("NO_GUI") is None)
     this_is_the_last_animation_frame = False
@@ -185,7 +191,7 @@ def main(current_animation_step: int = None):
         except:
             print(f"failed loading mesh file {fname}, skipping")
             continue
-        mesh = ps.register_surface_mesh("mesh", polysoup.vertices, polysoup.indices,
+        mesh = ps.register_surface_mesh("mesh", maybe_negate_x_axis(polysoup.vertices), polysoup.indices,
             color=utils.PS_COLOR_SURFACE_MESH)
         mesh.set_transparency(PS_MESH_OPACITY_WITH_HIGHLIGHT if __HIGHLIGHT_EDITS else 1.0)
 
@@ -199,19 +205,23 @@ def main(current_animation_step: int = None):
                 read_mesh_slices_npz_file_for_polyscope(slices_npz_fname, consolidate_into_one_curve_network=not do_highlight_edits)
             
             if not do_highlight_edits:
-                cunet = ps.register_curve_network("loops", loop_pts, loop_conn_arr, color=utils.PS_COLOR_CURVE_NETWORK, radius=0.004)
-                cunet.add_vector_quantity("loopnormals", loop_segment_normals, length=0.15, enabled=False)
+                cunet = ps.register_curve_network("loops", maybe_negate_x_axis(loop_pts), loop_conn_arr, color=utils.PS_COLOR_CURVE_NETWORK, radius=0.004)
+                cunet.add_vector_quantity("loopnormals", maybe_negate_x_axis(loop_segment_normals), length=0.15, enabled=False)
             else:
                 closed_loops = distinguish_disjoint_loops_lite(loop_pts, loop_conn_arr, loop_segment_normals)
                 # for loop_i, (pts, conn, normals) in enumerate(zip(loop_pts, loop_conn_arr, loop_segment_normals)):
                 min_highlight_edit = min(__HIGHLIGHT_EDITS) if __HIGHLIGHT_EDITS else 99999
                 n_closed_loops = len(closed_loops)
                 for loop_i, (pts, conn, normals) in enumerate(closed_loops):
+                    cunet_enabled = False
+                    cunet_color = (0.,0.,0.)
                     if loop_i < min_highlight_edit:
                         cunet_color = PS_COLOR_CUNET_BELOW_EDIT
                         cunet_enabled = False if __APPEARANCE_ABOVE_EDIT == "flip" else True
                     elif loop_i in __HIGHLIGHT_EDITS:
                         cunet_color = PS_COLOR_CUNET_AT_EDIT
+                        if loop_i in __HIGHLIGHT_EXTRA_SPECIAL_EDITS:
+                            cunet_color = PS_COLOR_CUNET_AT_EXTRA_SPECIAL_EDIT
                         cunet_enabled = True
                     elif loop_i > min_highlight_edit:
                         # not an explicitly edited loop, but still
@@ -237,16 +247,16 @@ def main(current_animation_step: int = None):
                     # only apply (&&) if current_animation_step is defined.
                     cunet_enabled = cunet_enabled and ((current_animation_step is None) or (loop_i <= current_animation_step))
 
-                    cunet = ps.register_curve_network(f"cunet{loop_i}", pts, conn, color=cunet_color, enabled=cunet_enabled, radius=0.004)
-                    cunet.add_vector_quantity(f"normals{loop_i}", normals, length=0.15, enabled=False)
+                    cunet = ps.register_curve_network(f"cunet{loop_i}", maybe_negate_x_axis(pts), conn, color=cunet_color, enabled=cunet_enabled, radius=0.004)
+                    cunet.add_vector_quantity(f"normals{loop_i}", maybe_negate_x_axis(normals), length=0.15, enabled=False)
 
                     if loop_i in __DRAW_PLANE_AT_LOOP:
                         plane_mesh_points, plane_mesh_conn, plane_mesh_cunet = make_fake_plane_mesh(pts, register_ps_slice_plane=True)
-                        fake_plane_mesh = ps.register_surface_mesh(f"plane at loop {loop_i}", plane_mesh_points, plane_mesh_conn, color=PS_COLOR_SLICEPLANE)
+                        fake_plane_mesh = ps.register_surface_mesh(f"plane at loop {loop_i}", maybe_negate_x_axis(plane_mesh_points), plane_mesh_conn, color=PS_COLOR_SLICEPLANE)
                         fake_plane_mesh.set_transparency(0.5)
-                        ps.register_curve_network(f"planeborder at loop {loop_i}", plane_mesh_points, plane_mesh_cunet, color=PS_COLOR_SLICEPLANE_BORDER)
+                        ps.register_curve_network(f"planeborder at loop {loop_i}", maybe_negate_x_axis(plane_mesh_points), plane_mesh_cunet, color=PS_COLOR_SLICEPLANE_BORDER)
                     if loop_i in __DRAW_HIGHLIGHTED_LOOPS_NODES:
-                        ps.register_point_cloud(f"loop nodes at loop {loop_i}", pts)
+                        ps.register_point_cloud(f"loop nodes at loop {loop_i}", maybe_negate_x_axis(pts))
                 # finished iterating thru all loops... now decide whether this was the last frame
                 this_is_the_last_animation_frame = this_is_the_last_animation_frame or \
                     (current_animation_step is None or (current_animation_step > n_closed_loops))

@@ -18,7 +18,7 @@ class LoopSeqOptions:
         # 
         self.parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-        self.parser.add_argument('--architecture', type=str, default='lstm', choices=['lstm', 'transformer', 'lstm+transformer'], help=
+        self.parser.add_argument('--architecture', type=str, default='lstm', choices=['lstm', 'transformer', 'lstm+transformer', 'pointnet+transformer'], help=
             "choose the model architecture to use. default: lstm; options are [lstm, transformer, lstm+transformer]. "
             "If `lstm` is chosen, then the options enc_lstm_hidden_size, enc_bidirectional, lstm_hidden_size, lstm_n_layers are applicable."
             "If `transformer` is chosen, then the options "
@@ -26,8 +26,14 @@ class LoopSeqOptions:
             "dec_transformer_n_layers, dec_transformer_n_heads, dec_transformer_ffwd_size "
             "are available. "
             "If `lstm+transformer` is chosen, then the enc_transformer_* options"
-            "are available, plus enc_lstm_hidden_size, and lstm_*"
+            "are available, plus enc_lstm_hidden_size, and lstm_*. "
+            "The pointnet+transformer architecture is a pointnet encoder + a transformer decoder; "
+            "all dec_transformer* arguments apply, in addition to pointnet_hidden_size"
             )
+        
+        # fourier map options 
+        self.parser.add_argument('--fourier_map_size', type=int, default=None, help="fourier feature map size before projecting to transformer d model")
+        self.parser.add_argument('--fourier_map_sigma', type=float, default=4.0, help="fourier feature map sigma value")
 
         # LSTM options
         self.parser.add_argument('--enc_lstm_hidden_size', type=int, default=64, help='encoder lstm hidden layer size')
@@ -36,6 +42,8 @@ class LoopSeqOptions:
         self.parser.add_argument('--lstm_hidden_size', type=int, default=64, help='decoder lstm hidden layer size')
         self.parser.add_argument('--lstm_n_layers', type=int, default=1, help='number of lstm layers to stack')
 
+        # PointNet options, for architecture "pointnet+transformer"
+        self.parser.add_argument('--pointnet_hidden_size', type=int, default=128, help="hidden feature size for pointnet encoder for --architecture pointnet+transformer and others that use a pointnet")
         # Transformer options
 
         # I didn't have this option in the first version (v0) 
@@ -62,12 +70,14 @@ class LoopSeqOptions:
         self.parser.add_argument('--enc_kl_min', type=float, default=0.05, help='minimum KL loss, to prevent overemphasizing optimizing the KL div during training')
         self.parser.add_argument('--enc_kl_weight', type=float, default=0.5, help='weight applied to KL divergence loss; also to control how important it is to enforce the latent distribution')
         self.parser.add_argument('--enc_kl_anneal_cycle', type=int, default=100, help='cycle length (in number of iterations, not epochs) for the cyclic KL annealing rule. If (-1) then no KL annealing is done (useful for resuming from a previous epoch at an already-annealed KL stage.')
+        self.parser.add_argument('--enc_kl_anneal_formula', type=str, default='ramp', choices=['ramp', 'cyclic'], help='type of KL annealing formula. Use either "ramp" or "cyclic".')
         self.parser.add_argument('--latent_size', type=int, default=8, help='number of dimensions for latent vectors')
         self.parser.add_argument('--enc_fc_hidden_sizes', type=int, nargs='*', default=[64,64], help='sizes of each hidden layer in the FCs that map the encoder final hidden state to sampling parameters for the latent vector')
         self.parser.add_argument('--dec_fc_hidden_sizes', type=int, nargs='*', default=[64,64], help='sizes of each hidden layer in the FC net that maps the latent vector to the initial decoder hidden state')
 
         # loss options
         self.parser.add_argument('--reco_loss_type', type=str, default='l2', choices=['l1', 'l2'], help='reconstruction loss metric; choose either l1 or l2.')
+        self.parser.add_argument('--binary_flag_loss_weight', type=float, default=1.0, help="weight for the binary crossentropy loss term, default 1.0")
 
         # learning setup and checkpointing options
         self.parser.add_argument('--gpu_ids', type=int, default=[0], nargs='+', help='gpu ids space separated. use -1 for CPU')
@@ -77,6 +87,7 @@ class LoopSeqOptions:
         self.parser.add_argument('--niter', type=int, default=20, help='# of iter at starting learning rate')
         self.parser.add_argument('--niter_decay', type=int, default=20, help='# of iter to linearly decay learning rate to zero')
         self.parser.add_argument('--lr', type=float, default=0.001, help='initial learning rate for adam')
+        self.parser.add_argument('--optimizer', type=str, choices=["adam", "adamw"], default="adam", help="choose an optimizer; default: 'adam'")
 
         # dataset options
         self.parser.add_argument('--data_norm_by', type=str, choices=['per_value', 'whole_array', 'none'], default='per_value', help='per_value normalizes the sequence dataset by coordinate; whole_array calculates a single mean/std scalar using every element in all sequences')
@@ -113,6 +124,7 @@ class LoopSeqOptions:
             assert has_field(self.opt, argname), f'needs argument {argname}'
         __enforce_arg('mode')
         __enforce_arg('save_dir')
+        assert self.opt
         self.opt.is_train = self.opt.mode == 'train'
         if self.opt.mode == 'npz':
             assert has_field(self.opt, 'single_npz'), "No npz file specified"

@@ -119,8 +119,8 @@ def do_transformer_inference( model
         fed into the decoder for the next timestep.
         
     """
-    assert (model.opt.architecture == "transformer"), \
-        "model architecture needs to be `transformer` to run this function"
+    assert lmodels.architecture_type_has_a_transformer_decoder(model.opt.architecture), \
+        "model architecture needs to have a transformer decoder to run this function"
     
     # the dummy zeros start-of-sequence step counts now, hence +1
     n_time_steps = dataset_to_get_norm.n_steps + 1
@@ -206,6 +206,8 @@ def run_inference_and_viz(model: lmodels.LoopSeqEncoderDecoderModel,
 
     Returns (predicted_sequence, latent_z (if applicable; None otherwise))
     """
+    if thlog.guard(VIZ_NONE, needs_polyscope=True):
+        ps.remove_all_structures()
     if using_the_sequence is None:
         if model.opt.architecture in ("lstm", "lstm+transformer"):
             # for the LSTM we don't have learned start embeddings, we just used 
@@ -213,11 +215,13 @@ def run_inference_and_viz(model: lmodels.LoopSeqEncoderDecoderModel,
             start_split = np.zeros(dataset.n_input_features) 
             pred_seq = do_lstm_inference(model, dataset, start_split, latent_z, 
             fn_after_each_timestep=fn_after_each_timestep)
-        elif model.opt.architecture == "transformer":
+        elif model.opt.architecture in ("transformer", "pointnet+transformer") :
             # for transformers, we do have a learned start embedding, and the
             # model will fill that in for us so no need to make start_split here
             pred_seq = do_transformer_inference(model, dataset, latent_z, 
             fn_after_each_timestep=fn_after_each_timestep)
+        else:
+            raise NotImplementedError(f"unhandled inference functionality for architecture type {model.opt.architecture}")
     elif using_the_sequence.shape == (dataset.n_steps,) :
         raise NotImplementedError("deprecated")
         pred_seq = do_lstm_inference(model, dataset, start_split, latent_z, 
@@ -253,7 +257,7 @@ def run_inference_and_viz(model: lmodels.LoopSeqEncoderDecoderModel,
             min_n_points_per_loop=24,
             use_eos_token = model.opt.use_eos_token,
             postprocessing_heuristics=
-                ['prevent-thin-loops', 'caps', 'smooth-normals']
+                [ 'caps', 'smooth-normals']
             ) 
     else:
         raise NotImplementedError(f"loop representation {loop_repr_type} not"
@@ -269,7 +273,7 @@ def run_inference_and_viz(model: lmodels.LoopSeqEncoderDecoderModel,
         loop_repr_object.export_as_npz_file(
             os.path.join(model.save_dir, "inference", f"inference-{save_filename_suffix}-slices.npz"))
     
-    if thlog.guard(VIZ_INFO, needs_polyscope=True) or save_filename_suffix is not None: 
+    if thlog.guard(VIZ_INFO, needs_polyscope=True) or save_filename_suffix is not None:
         # normalize all the normal vectors for output
         all_normals /= np.transpose(
             np.tile(np.linalg.norm(all_normals, axis=1), (3, 1)))
@@ -486,7 +490,8 @@ def inference_main():
                 break
             else:
                 inference_repl.repl_print(f"caught an error while running the inference task:\n {repr(e)}", is_error=True)
-                continue
+                raise e
+                # continue
 
 if __name__ == "__main__":
     inference_main()

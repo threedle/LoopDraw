@@ -3,7 +3,7 @@
 # for ground-truth shape viewing in the inference console.
 
 --dataroot datasets/coseg-vases/ 
---save_dir checkpoints/coseg-vases-0.2KL-09-16.2/
+--save_dir checkpoints/coseg-vases-0.2KL-01-11.1/
 --mode test
 --load_epoch -1 
 

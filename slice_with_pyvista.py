@@ -1,7 +1,6 @@
 # slice a mesh using pyvista and return the arrays needed by
 # get_loops.MeshOneSlice.
-import numpy as np
-import vtk 
+import numpy as np 
 import pyvista
 
 def slice_mesh_using_pyvista(fname: str, plane: np.ndarray):

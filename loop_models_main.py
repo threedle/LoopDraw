@@ -1,3 +1,4 @@
+from typing import Union, Tuple
 import sys
 import numpy as np
 import torch
@@ -13,11 +14,11 @@ SAVE_INTERVAL = 10
 
 ########## Training and testing code ##############
 
-def loss_averager_multiloss(loss_list: list):
+def loss_averager_multiloss(loss_list: list) -> Union[float, Tuple[float, ...]]:
     # calculates average loss(es) from a list of iterables of loss metrics;
     # used for models which report multiple sub-losses to add together (in our case, KL and reco)
     if isinstance(loss_list[0], float):
-        return np.mean(loss_list)
+        return float(np.mean(loss_list))
     return tuple(np.mean(np.array(list(map(list, loss_list))), axis=0))
 
 def calc_summary_loss(loss_tuple_or_val):
@@ -109,6 +110,7 @@ if __name__ == "__main__":
     if DRY_RUN:
         thlog.info("Currently in a DRY-RUN, no checkpoints will be saved!")
     opt = loptions.LoopSeqOptions().parse_cmdline()
+    assert opt
     assert opt.mode in ('train', 'test')
 
     has_test_dataset = os.path.isdir(os.path.join(opt.dataroot, 'test'))
@@ -146,9 +148,12 @@ if __name__ == "__main__":
             thlog.info("Ok now loading the test set to run whole-test-set tests.")
             test_dataset = lmodels.LoopSeqDataset(opt, override_mode='test', pad_to_max_sequence_length=trained_on_max_seq_len)
         else:
+            train_dataset = None
             test_dataset = lmodels.LoopSeqDataset(opt, override_mode='train')
         dataset_n_input_features = test_dataset.n_input_features
         dataset_n_steps = test_dataset.n_steps
+    else:
+        raise ValueError("unknown mode, use either 'train' or 'test'")
         
             
     thlog.info(f"number of time steps per sequence is {dataset_n_steps}")
@@ -164,8 +169,11 @@ if __name__ == "__main__":
             thlog.info(f'[TEST] epoch {epoch_num} running test')
             outs, losses = run_tests(opt, model, test_dataset)
             average_test_loss = loss_averager_multiloss(losses)
+            if not isinstance(average_test_loss, tuple):
+                average_test_loss = (float(average_test_loss),)
             model.write_loss_log(epoch_num, average_test_loss, True)
             return average_test_loss
         
         __do_nothing = None
+        assert train_dataset, "train dataset must be present in train mode"
         run_training_loop(opt, model, train_dataset, test_callback=__do_nothing, save_by_best_loss=False)

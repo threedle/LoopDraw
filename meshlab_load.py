@@ -50,10 +50,11 @@ def load_via_meshlab(fname: str, convert_to_obj=False, simplify_to: int = -1):
     ms.set_selection_none()
     ms.meshing_close_holes(maxholesize = 125)
     ms.set_selection_none()
+    ms.compute_matrix_from_translation(traslmethod=1, alllayers=True, freeze=True)
+    ms.set_selection_none()
     ms.compute_matrix_from_scaling_or_normalization(alllayers=True, unitflag=True, freeze=True)
     ms.set_selection_none()
     # translate to origin; so the mesh will end up centered in a unit cube.
-    ms.compute_matrix_from_translation(traslmethod=1, alllayers=True, freeze=True)
     
         
 

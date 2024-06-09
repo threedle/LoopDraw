@@ -56,6 +56,15 @@ def orientation_of_3pts_in_2d(p: np.ndarray, q:  np.ndarray, r: np.ndarray):
     """
     return np.sign(np.cross(q - p, q - r))
 
+def polygon_area(x,y):
+    """ calculates the area of a polygon in 2D given its points in a consistent
+    orientation. 
+    x is a 1d array of all x coords; y is the same shape. 
+    """
+    # from https://stackoverflow.com/a/49129646
+    correction = x[-1] * y[0] - y[-1]* x[0]
+    main_area = np.dot(x[:-1], y[1:]) - np.dot(y[:-1], x[1:])
+    return 0.5*np.abs(main_area + correction)
 
 def unit(arr):
     return arr / np.linalg.norm(arr)

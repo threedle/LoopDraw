@@ -56,16 +56,31 @@ def sample_point_cloud_from_obj_file(fname, n_points:int, save_filename = None):
     
 
 
-def sample_point_clouds_for_directory_of_meshes(directory: str, n_points: int, recursive_glob=False):
-    """ dataroot is the path to the dataset's main directory.
-        subdir is the folder under it; i.e. 'train', or 'test'.
-
+def sample_point_clouds_for_directory_of_meshes(directory_or_list_of_fnames, n_points: int, recursive_glob=False, save_filename=None):
+    """ 
         Samples point clouds of a whole folder of .obj files, and saves out
         a single "sampled_point_clouds_<n_meshes>x<n_points>p.npz" file in the directory
-        that contains a pts array of shape (n_meshes, n_points, 3), and a 
-        normals array of shape (n_meshes, n_points, 3).
+        that contains a 'points' array of shape (n_meshes, n_points, 3), and a 
+        'normals' array of shape (n_meshes, n_points, 3).
+
+        "directory_or_list_of_fnames" can either be a string (a directory path containing the obj files)
+        or a list of filenames, which is a list of the obj files to sample.
+
+        to override the save filename (which does not support filling in n_meshes and n_points in the filename)
+        pass it into save_filename kwarg
     """
-    fnames = glob.glob(os.path.join(directory, "*.obj"))
+    if isinstance(directory_or_list_of_fnames, str):
+        directory = directory_or_list_of_fnames
+        if recursive_glob:
+            fnames = glob.glob(os.path.join(directory, '**', '*.obj'), recursive=True)
+        else:
+            fnames = glob.glob(os.path.join(directory, '*.obj'), recursive=False)
+        fnames = sorted(fnames) # to make it line up with the globbing in dataset generation in loop_models.py
+    elif isinstance(directory_or_list_of_fnames, list):
+        fnames = directory_or_list_of_fnames
+    else:
+        raise ValueError("directory_or_list_of_fnames must either be a string (path to directory of obj files) or a list of paths to .obj files")
+
     all_pcloud_points = []
     all_pcloud_normals = []
     for fname in fnames:
@@ -77,7 +92,8 @@ def sample_point_clouds_for_directory_of_meshes(directory: str, n_points: int, r
     all_pcloud_points = np.array(all_pcloud_points)
     all_pcloud_normals = np.array(all_pcloud_normals)
     thlog.info(f"There are {all_pcloud_points.shape[0]} point clouds, each with {all_pcloud_points.shape[1]} points.")
-    save_filename = os.path.join(directory, f"sampled_point_clouds_{all_pcloud_points.shape[0]}x{all_pcloud_points.shape[1]}p.npz")
+    if save_filename is None:
+        save_filename = os.path.join(directory, f"sampled_point_clouds_{all_pcloud_points.shape[0]}x{all_pcloud_points.shape[1]}p.npz")
 
     thlog.info(f"Saving to {save_filename}")
     np.savez_compressed(save_filename

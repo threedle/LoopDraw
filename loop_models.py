@@ -1,19 +1,24 @@
+from typing import Optional, List, Tuple, Sequence
 import os
 from glob import glob
 from collections import OrderedDict # for GenericFCNet
 
 import numpy as np
 import torch
+import torch.utils.data
 import torch.nn as nn
 import fvcore.nn
 
 import loop_representations as loop_reprs
 import loop_model_options as loop_opts
+from meshlab_point_clouds import sample_point_clouds_for_directory_of_meshes
+import helper_networks
 from utils import read_planespec_file, vstack_with_padding, pad
 from thlog import *
 
 thlog = Thlogger(LOG_INFO, VIZ_NONE, "model", imports=[loop_reprs.thlog])
-np.warnings.filterwarnings('error', category=np.VisibleDeprecationWarning)
+import warnings 
+warnings.filterwarnings('error', category=np.VisibleDeprecationWarning)
 
 ## dataloading for loop representations
 
@@ -23,7 +28,7 @@ def ls_all_datafiles_under_dataroot(dir, ext, recursive=False):
         original_fpaths = glob(os.path.join(dir, '**', '*{}'.format(ext)), recursive=True)
     else:
         original_fpaths = glob(os.path.join(dir, '*{}'.format(ext)), recursive=False)
-    return original_fpaths
+    return sorted(original_fpaths)
 
 def validate_cache_repr_type(cache_npz, loop_repr_type_being_used) -> bool:
     """ returns True if the cache's repr type and our repr type match.
@@ -37,13 +42,17 @@ def validate_cache_repr_type(cache_npz, loop_repr_type_being_used) -> bool:
         loop_repr_type_of_cache = loop_reprs.LOOP_REPR_ELLIPSE_MULTIPLE
     return loop_repr_type_of_cache == loop_repr_type_being_used
 
+# helper to determine if the chosen architecture type has a transformer decoder
+def architecture_type_has_a_transformer_decoder(architecture):
+    return architecture in ("transformer", "pointnet+transformer")
+
 # this dataset class is actually general enough to be used with any sequence data
 class LoopSeqDataset(torch.utils.data.Dataset):
     def __init__(self, opt, 
         override_mode = '', 
         override_paths = [], 
-        override_mean_std: tuple = None,
-        pad_to_max_sequence_length: int = None,
+        override_mean_std: Optional[tuple] = None,
+        pad_to_max_sequence_length: Optional[int] = None,
         regenerate_cache = False):
         """ A dataset class for feeding in loop sequence inputs to the model.
         Optional args
@@ -93,6 +102,11 @@ class LoopSeqDataset(torch.utils.data.Dataset):
         # check for cached planes + loaded slices
         cache_path = os.path.join(self.dir, "preprocessed_cache.npz")
         partial_cache_path = os.path.join(self.dir, "preprocessed_cache_PARTIAL.npz")
+
+        # point cloud files are also generated for the pointnet encoder experiment
+        pointcloud_cache_path = os.path.join(self.dir, "preprocessed_sampled_point_clouds.npz")
+        
+        # generate or obtain the main sequence data cache file
         if os.path.isfile(cache_path) and (not regenerate_cache):
             # COMPLETE cache file exists
             thlog.info(
@@ -101,6 +115,8 @@ class LoopSeqDataset(torch.utils.data.Dataset):
 
             self.planes = cache_npz['planes']
             self.meshes_reprs = cache_npz['meshes_reprs']
+            loaded_obj_filenames = cache_npz.get('loaded_obj_filenames')  # NOTE caches made before 2023-04-06 this will be None!
+            loaded_obj_filenames = list(loaded_obj_filenames) if loaded_obj_filenames is not None else None
 
             # NOTE versioning now added (08-03)
             if not (validate_cache_repr_type(cache_npz, self.opt.loop_repr_type)):
@@ -112,6 +128,7 @@ class LoopSeqDataset(torch.utils.data.Dataset):
             next_index_to_load = 0
             meshes_reprs_load = None
             failed_meshes_indices = []
+            loaded_obj_filenames = []
             n_skipped_meshes = 0
             self.planes = None
 
@@ -126,8 +143,10 @@ class LoopSeqDataset(torch.utils.data.Dataset):
                     meshes_reprs_load = partial_cache_npz["meshes_reprs"]
                     self.planes = partial_cache_npz["planes"]
                     failed_meshes_indices = list(partial_cache_npz["failed_meshes_indices"])
-                    n_skipped_meshes = len(failed_meshes_indices)
 
+                    # enforcing after 2023-04-06 that any partial caches must have this field (list of filenames loaded)
+                    loaded_obj_filenames = list(partial_cache_npz["loaded_obj_filenames"])  
+                    n_skipped_meshes = len(failed_meshes_indices)
 
 
             # define slice planes for the loops here, if not already loaded
@@ -164,9 +183,14 @@ class LoopSeqDataset(torch.utils.data.Dataset):
                     n_skipped_meshes += 1
                     failed_meshes_indices.append(idx_in_obj_paths)
                     continue
+                assert isinstance(repr_data, np.ndarray)
                 repr_data = np.expand_dims(repr_data, axis=0)
                 meshes_reprs_load = repr_data if meshes_reprs_load is None else\
                     vstack_with_padding((meshes_reprs_load, repr_data))
+                
+                loaded_obj_filenames.append(fname)
+                # ^^^ this is to remember how the filenames in the data directory
+                # correspond to the cached data items in the .npz
                 next_index_to_load += 1
                 # ^^ this value is an index in self.obj_paths.
                 # new 2022-08-18: partial cache checkpoint: save a partial
@@ -179,10 +203,11 @@ class LoopSeqDataset(torch.utils.data.Dataset):
                         planes=self.planes, meshes_reprs=meshes_reprs_load, 
                         loop_repr_type=self.opt.loop_repr_type,
                         next_index_to_load=next_index_to_load,
-                        failed_meshes_indices=np.asarray(failed_meshes_indices, dtype=int)
+                        failed_meshes_indices=np.asarray(failed_meshes_indices, dtype=int),
+                        loaded_obj_filenames=loaded_obj_filenames
                         )
 
-            # if code gets to this point, the loading loop has completed
+            # if code gets to this point, the meshes reprs loading loop has completed
             if meshes_reprs_load is None:
                 raise ValueError("Dataset has loaded no items.")
             # we have been padding on the fly while appending to meshes_reprs_load,
@@ -191,7 +216,9 @@ class LoopSeqDataset(torch.utils.data.Dataset):
             thlog.info(f"[DATA ] Saving loaded dataset as cache file {cache_path}")
             np.savez_compressed(cache_path, 
                 planes=self.planes, meshes_reprs=self.meshes_reprs, 
-                loop_repr_type=self.opt.loop_repr_type)
+                loop_repr_type=self.opt.loop_repr_type,
+                loaded_obj_filenames=loaded_obj_filenames
+                )
 
             if n_skipped_meshes > 0: 
                 thlog.info(f"[DATA ] note that {n_skipped_meshes} meshes were skipped due to failing loading")
@@ -202,9 +229,35 @@ class LoopSeqDataset(torch.utils.data.Dataset):
             # delete the partial cache (also new part of 2022-08-18)
             if os.path.isfile(partial_cache_path):
                 os.remove(partial_cache_path)
+        
+
+        # new: generate or obtain point cloud cache 
+        self.meshes_sampled_point_clouds = None
+        if ("pointnet" in opt.architecture): 
+            if (os.path.isfile(pointcloud_cache_path)) and (not regenerate_cache):
+                thlog.info(
+                    f"[DATA ] (For a PointNet-involved experiment) Point cloud cache exists, loading point clouds from {pointcloud_cache_path}")
+                # the line that loads is below this if block... both scenarios load from the same file
+            else:
+                # generate point clouds and load it. pointcloud uses 2048 points
+                if loaded_obj_filenames is None:
+                    raise ValueError("can't sample pointclouds given main mesh representation cache loading which didn't return the list of filenames successfully loaded. "
+                    "(This is necessary for pairing point clouds to the correct representation data saved in that cache.)... Try regenerating preprocessed_cache.npz with the current new code")
+                sample_point_clouds_for_directory_of_meshes(loaded_obj_filenames, 2048, save_filename=pointcloud_cache_path)
+
+            # now load the point cloud file, either just genned or was saved as cache from before
+            with np.load(pointcloud_cache_path) as pointcloud_npz:
+                self.meshes_sampled_point_clouds = pointcloud_npz["points"]
+
+        
+        # at this point all cache obtaining/generating has been done
         # shape[0] = number of meshes, shape[1] = number of slices/steps per mesh,
         # shape[2] = number of features in the loop representation
         thlog.info(f"Shape of {self.mode} dataset is (num meshes, num timesteps, features) {self.meshes_reprs.shape}")
+
+        # new 2023-04-06 point cloud loading
+        if self.meshes_sampled_point_clouds is not None:
+            thlog.info(f"Also loaded point clouds array, of shape (num_meshes, num_points_per_pcloud, spatial_dims) {self.meshes_sampled_point_clouds.shape}")
         
         # new 2022-09-26: proper support for separate test sets. Different sets
         # may have different max lengths, hence this, in case we need to pad
@@ -253,14 +306,14 @@ class LoopSeqDataset(torch.utils.data.Dataset):
                 
             elif self.opt.data_norm_by == 'whole_array': # probably not much use for this option...
                 self.dataset_mean = np.mean(self.meshes_reprs) # fold all values into scalar mean and std
-                self.dataset_std = np.std(self.meshes_reprss) 
+                self.dataset_std = np.std(self.meshes_reprs) 
             else:
                 thlog.debug("[DATA ] Based on --data_norm_by argument, no normalization will be done.")
                 self.do_norm = False
                 self.dataset_mean = None
                 self.dataset_std = None
 
-        if self.do_norm and (
+        if self.do_norm and self.dataset_mean is not None and self.dataset_std is not None and (
             (np.count_nonzero(self.dataset_std)) != np.size(self.dataset_std)):
             thlog.debug("[DATA ] Some features of the sequence have 0 standard deviation! No normalization will be done.")
             self.do_norm = False
@@ -284,12 +337,16 @@ class LoopSeqDataset(torch.utils.data.Dataset):
         indices_to_grab = self.seqs_index_map[
             np.arange(start_index, min(start_index + self.batch_size, self.n_seqs))]
         full_seqs = self.meshes_reprs[indices_to_grab]
+        
+        # new 2023-04-06 point clouds for pointnet encoder experiment
+        point_clouds = self.meshes_sampled_point_clouds[indices_to_grab] if self.meshes_sampled_point_clouds is not None else None
+
         # turn into (Timesteps, Batch, Features)
         full_seqs = np.transpose(full_seqs, (1, 0, 2))
         # prepend with a dummy step, so that LSTM can predict the whole thing
         seqs_train = np.vstack((np.expand_dims(np.zeros_like(full_seqs[0]), axis=0), full_seqs))
         seqs_target = full_seqs
-        return { 'inp': seqs_train, 'trg': seqs_target }
+        return { 'inp': seqs_train, 'trg': seqs_target, 'pcloud': point_clouds }
 
     def shuffle_batches(self):
         """ run this after each epoch / each complete runthrough of dataset """
@@ -315,21 +372,30 @@ class LoopSeqDataset(torch.utils.data.Dataset):
             data_item['trg'][trg_timesteps_that_are_zero] = 0
         return data_item
     
-    def find_closest_data_item(self, seq: np.ndarray) -> int:
+    def find_closest_data_item(self, seq: np.ndarray) -> Tuple[float, int]:
         """ returns the index of the data item that is the closest by L2 distance
         to the given data item. seq is of shape (timesteps, features) """
         distances = np.mean((self.meshes_reprs - seq) ** 2, axis=(1,2)) # shape (len(meshes_reprs))
-        return np.min(distances), np.argmin(distances)
+        return np.min(distances), int(np.argmin(distances))
 
         
+def get_nonlinearity_from_name(name: str) -> nn.Module:
+    if name == "relu":
+        return nn.ReLU(inplace=True)
+    elif name == "leakyrelu":
+        return nn.LeakyReLU(0.01, inplace=True)
+    elif name == "tanh":
+        return nn.Tanh()
+    else:
+        raise ValueError(f"unavailable nonlinearity name '{name}', use either 'relu', 'leakyrelu', or 'tanh'")
 
 class GenericFCNet(nn.Module):
     def __init__(self, 
         flattened_in_size: int, 
         hidden_layer_sizes: list, 
         out_size: int, 
-        nonlinearity_between_hidden_layers: nn.Module = nn.ReLU(),
-        nonlinearity_at_the_end: nn.Module = nn.Tanh()):
+        nonlinearity_between_hidden_layers: str = "leakyrelu",
+        nonlinearity_at_the_end: Optional[str] = "tanh"):
         """
         A generic fully-connected module with configurable n of multiple hidden
         layers. Automatically flattens the input (but respecting batching, which
@@ -350,17 +416,17 @@ class GenericFCNet(nn.Module):
         """
         super(GenericFCNet, self).__init__()
         fc_in_size = flattened_in_size
-        moduleseq = [('flattener', nn.Flatten())] # will flatten all dims after batch
+        moduleseq: List[Tuple[str, nn.Module]] = [('flattener', nn.Flatten())] # will flatten all dims after batch
         for i, fc_out_size in enumerate(hidden_layer_sizes):
             moduleseq.append(('fc{}'.format(i), nn.Linear(fc_in_size, fc_out_size)))
-            moduleseq.append(('nonlin{}'.format(i), nonlinearity_between_hidden_layers))
+            moduleseq.append(('nonlin{}'.format(i), get_nonlinearity_from_name(nonlinearity_between_hidden_layers)))
             #moduleseq.append(('dropout{}'.format(i), nn.Dropout(0.2)))
             fc_in_size = fc_out_size # this layer's output size is next layer's input size
         
         moduleseq.append(('out', nn.Linear(fc_in_size, out_size)))
 
         if nonlinearity_at_the_end is not None:
-            moduleseq.append(('nonlinEnd', nonlinearity_at_the_end)) 
+            moduleseq.append(('nonlinEnd', get_nonlinearity_from_name(nonlinearity_at_the_end))) 
         
         self.fcnet = nn.Sequential(OrderedDict(moduleseq))
     
@@ -419,6 +485,7 @@ class PlanePositionalEncoding(nn.Module):
         positional_embedding_additives[:, 1::2] = torch.cos(positions * div_term)
         # shape (max_sequence_length + 1, d_model)
         self.register_buffer('positional_embedding_additives', positional_embedding_additives)
+        self.positional_embedding_additives: torch.Tensor
     
     def forward(self, x_original, x_projected_to_d_model, 
         first_timestep_is_not_a_loop=True, ignore_plane_flags=False):
@@ -459,6 +526,31 @@ class PlanePositionalEncoding(nn.Module):
             pos_embed_additive = self.positional_embedding_additives[
                 torch.tile(torch.arange(x_projected_to_d_model.shape[0]), (x_projected_to_d_model.shape[1], 1)).T]
         return x_projected_to_d_model + pos_embed_additive
+
+class LoopSeqPointNetEncoderNet(nn.Module):
+    def __init__(self, latent_size, pointnet_hidden_size):
+        super().__init__()
+        self.latent_size = latent_size
+        self.pointnet_to_mu = helper_networks.SimplePointnet(latent_size, 3, hidden_dim=pointnet_hidden_size)
+        self.pointnet_to_sigma = helper_networks.SimplePointnet(latent_size, 3, hidden_dim=pointnet_hidden_size)
+    
+    def forward(self, x):
+        """
+        x is an input point cloud (batch, n_points, 3) for the original shape
+        (shouldn't be the sliced points, but the real original point cloud
+        sampled from the original mesh)
+        """
+        # get mu and sigma
+        pred_mu = self.pointnet_to_mu(x)
+        pred_log_of_sigma_squared = self.pointnet_to_sigma(x)
+        
+        sampling_sigma = torch.exp(pred_log_of_sigma_squared / 2)  # what we predict is actually log of sigma^2... 
+        # for sampling it should be 'real sigma'
+
+        # sample a latent from these parameters
+        sampled_from_N = torch.normal(torch.zeros(self.latent_size), torch.ones(self.latent_size)).to(x.device)
+        sampled_z = pred_mu + sampling_sigma * sampled_from_N
+        return sampled_z, pred_mu, pred_log_of_sigma_squared
 
 
 class LoopSeqTransformerEncoderNet(nn.Module):
@@ -698,6 +790,39 @@ class LoopSeqDecoderFromLatentNet(nn.Module):
         lstm_out, (h_n, c_n) = self.lstm(x_with_z, init_hc_states)
         return self.fc(lstm_out), (h_n, c_n)
 
+class FourierFeatureMap(nn.Module):
+    def __init__(self, n_input_features, fourier_map_size, fourier_map_sigma, fourier_map_period_pi):
+        super().__init__()
+        fourier_map_B = torch.normal(torch.zeros((fourier_map_size, n_input_features)), fourier_map_sigma)
+        self.register_buffer("fourier_map_B", fourier_map_B)
+        self.fourier_map_period_pi = fourier_map_period_pi
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_proj = (self.fourier_map_period_pi * torch.pi * x) @ self.fourier_map_B.T
+        return torch.cat((torch.sin(x_proj), torch.cos(x_proj)), dim=-1)
+
+class FourierFeatureMapAdapterForLoopSequences(nn.Module):
+    def __init__(self, fourier_map_size, fourier_map_sigma, fourier_map_period_pi):
+        super().__init__()
+        self.fourier_map_size = fourier_map_size
+        self.fourier_map = FourierFeatureMap(2, fourier_map_size, fourier_map_sigma, fourier_map_period_pi)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x is of shape (batch, seqlen, features) where features = 2*npoints+1
+        """
+        x_points = x[:, :, :-1]
+        x_lastfeature = x[:, :, -1:]
+        batch_size, seq_len, n_coords_features = x_points.shape
+        n_points_per_loop = n_coords_features // 2
+        x_points = x_points.view(batch_size, seq_len, n_points_per_loop, 2)
+        fourier_mapped_x_points = self.fourier_map(x_points)
+        # ^ shape (batch_size, seq_len, n_points_per_loop, fourier_map_size * 2)
+        # put the flag back on as the last feature. return shape is 
+        # (batch_size, seq_len, n_points_per_loop * fourier_map_size * 2 + 1)
+        return torch.cat((
+            fourier_mapped_x_points.view(batch_size, seq_len, n_points_per_loop * self.fourier_map_size * 2), 
+            x_lastfeature), dim=-1)
+
 
 class LoopSeqTransformerDecoderNet(nn.Module):
     def __init__(self, transformer_arch_version: int, # 09-16: versioning added
@@ -707,13 +832,25 @@ class LoopSeqTransformerDecoderNet(nn.Module):
         dec_transformer_ffwd_size: int, 
         latent_size: int, max_sequence_length: int, 
         dec_z2memory_fc_hidden_sizes: list, 
-        dropout: float = 0):
+        dropout: float = 0,
+        fourier_map_size: Optional[int]=None,
+        fourier_map_sigma: float=4.0):
 
         super().__init__()
 
         self.transformer_arch_version = transformer_arch_version
-
-        self.linear_in_to_dec = nn.Linear(in_size, dec_transformer_d_model)
+        
+        if fourier_map_size is None:
+            self.linear_in_to_dec = nn.Linear(in_size, dec_transformer_d_model)
+        else:
+            n_nonflag_features = (in_size - 1)
+            assert (n_nonflag_features % 2) == 0
+            n_points_per_loop = n_nonflag_features // 2
+            fourier_map_out_size = n_points_per_loop * fourier_map_size * 2 + 1
+            self.linear_in_to_dec = nn.Sequential(
+                FourierFeatureMapAdapterForLoopSequences(fourier_map_size, fourier_map_sigma, 2.0),
+                nn.Linear(fourier_map_out_size, dec_transformer_d_model))
+                
         self.positional_embedding = PlanePositionalEncoding(dec_transformer_d_model, max_sequence_length)
         
         # we don't use any cross-attention so our 'decoder'  actually uses the
@@ -746,7 +883,16 @@ class LoopSeqTransformerDecoderNet(nn.Module):
             if self.transformer_arch_version == 2:
                 self.fc_latent_to_binary_flags = GenericFCNet(
                     latent_size, dec_z2memory_fc_hidden_sizes, max_sequence_length)
-            
+
+        elif self.transformer_arch_version == 3:
+            # same as v1 but there are 5 timesteps that are predicted directly
+            # from the z vector. (highly experimental; the count 5 may change)
+            Z_TO_HOWMANY_LOOPS = 5
+            self.fc_latent_to_start_embedding = nn.ModuleList([
+                GenericFCNet(
+                latent_size, dec_z2memory_fc_hidden_sizes, in_size) for _ in range(Z_TO_HOWMANY_LOOPS)
+            ])
+
         
     
     def inject_latent_z_into_transformer_input(self, latent_z, x_projected_to_d_model):
@@ -771,6 +917,8 @@ class LoopSeqTransformerDecoderNet(nn.Module):
             return self.forward_v1(x, latent_z, key_padding_mask)
         elif self.transformer_arch_version == 2:
             return self.forward_v2(x, latent_z, key_padding_mask)
+        elif self.transformer_arch_version == 3:
+            return self.forward_v3(x, latent_z, key_padding_mask)
         else:
             raise NotImplementedError("unknown transformer arch version")
 
@@ -805,6 +953,32 @@ class LoopSeqTransformerDecoderNet(nn.Module):
         decoder_out = self.transformer_decoder(x, 
             mask=nn.Transformer.generate_square_subsequent_mask(
                 self.max_sequence_length).to(x.device),
+            src_key_padding_mask = key_padding_mask)
+        
+        # the None is to match the return tuple format of 
+        # LoopSeqDecoderFromLatentNet
+        out = self.linear_dec_to_out(decoder_out)
+        return out, (None, None)
+    
+    def forward_v3(self, x, latent_z, key_padding_mask, z_to_howmany_loops=5):
+        """ 
+        version 3 (highly experimental; 2023/01/22) 
+        predicts the first z_to_howmany_loops (default=5) tokens/loops directly
+        from the z vector. Uses 5 different fc_latent_to_start_embedding nets. 
+        Mostly to prevent the weird overfit-to-teacher-force thing.
+        """
+        seq_len = x.shape[0]
+        x = x.clone()
+        assert isinstance(self.fc_latent_to_start_embedding, nn.ModuleList)
+        for loop_i in range(z_to_howmany_loops):
+            x[loop_i, :, :] = self.fc_latent_to_start_embedding[loop_i](latent_z)
+        
+        x_projected_to_d_model = self.linear_in_to_dec(x)
+        x = self.positional_embedding(x, x_projected_to_d_model, first_timestep_is_not_a_loop=True, ignore_plane_flags=True)
+        key_padding_mask = key_padding_mask.T
+        decoder_out = self.transformer_decoder(x, 
+            mask=nn.Transformer.generate_square_subsequent_mask(
+                self.max_sequence_length).to(x.device),
             src_key_padding_mask = key_padding_mask 
             )
         
@@ -812,7 +986,7 @@ class LoopSeqTransformerDecoderNet(nn.Module):
         # LoopSeqDecoderFromLatentNet
         out = self.linear_dec_to_out(decoder_out)
         return out, (None, None)
-    
+
 
     def forward_v0(self, x, latent_z, key_padding_mask):
         """ should have an identical call interface to that of 
@@ -881,8 +1055,9 @@ class LoopSeqTransformerDecoderNet(nn.Module):
         output = torch.tile(torch.zeros(self.in_size, device=latent_z.device), (n_time_steps-1, 1)).unsqueeze(1)
         # no time step is padding in this inference context, so all False
         key_padding_mask = torch.zeros(self.max_sequence_length, 1, 
-            dtype=bool, device=latent_z.device)
+            dtype=torch.bool, device=latent_z.device)
         latent_z = latent_z.unsqueeze(0)
+
         for timestep_i in range(1, n_time_steps):
             decoder_output, _ = self.forward(output, latent_z, key_padding_mask)
             if timestep_i == n_time_steps - 1:
@@ -909,7 +1084,7 @@ class LoopSeqTransformerDecoderNet(nn.Module):
                     # for all subsequent time steps!!
                     if callable(latent_modification_function):
                         if self.transformer_arch_version == 0:
-                            thlog.error("transformer architecture v0 does not "
+                            thlog.err("transformer architecture v0 does not "
                             "support latent-conditioned start embedding and thus"
                             " does not support dynamic latent swapping during autoregressive generation.")
                         else:
@@ -1005,12 +1180,33 @@ class LoopSeqEncoderDecoderModel():
                         , self.LATENT_SIZE
                         , self.MAX_SEQUENCE_LENGTH
                         , opt.dec_fc_hidden_sizes
-                        , opt.dec_transformer_dropout))
+                        , opt.dec_transformer_dropout
+                        , fourier_map_size=opt.fourier_map_size
+                        , fourier_map_sigma=opt.fourier_map_sigma))
+        elif opt.architecture == "pointnet+transformer":
+            self.encoder = init_net_for_gpu(opt, 
+                LoopSeqPointNetEncoderNet(opt.latent_size, opt.pointnet_hidden_size)
+            )
+            self.decoder = init_net_for_gpu(opt, 
+                    LoopSeqTransformerDecoderNet(
+                          opt.transformer_arch_version
+                        , self.NUM_INPUT_FEATURES
+                        , opt.dec_transformer_d_model
+                        , opt.dec_transformer_n_heads
+                        , opt.dec_transformer_n_layers
+                        , opt.dec_transformer_ffwd_size
+                        , self.LATENT_SIZE
+                        , self.MAX_SEQUENCE_LENGTH
+                        , opt.dec_fc_hidden_sizes
+                        , opt.dec_transformer_dropout
+                        , fourier_map_size=opt.fourier_map_size
+                        , fourier_map_sigma=opt.fourier_map_sigma))
+            # set nn.Module training/eval mode (for dropout layers etc)
+            self.encoder.train(self.is_train)
+            self.decoder.train(self.is_train)
         else:
             raise ValueError("invalid model architecture type")
-        # set nn.Module training/eval mode (for dropout layers etc)
-        self.encoder.train(self.is_train)
-        self.decoder.train(self.is_train)
+        
 
         if opt.reco_loss_type == 'l2':
             thlog.info("using L2 loss")
@@ -1024,10 +1220,11 @@ class LoopSeqEncoderDecoderModel():
         loop_repr_type_being_used = opt.loop_repr_type
         if loop_reprs.loop_repr_uses_binary_levelup_flags(loop_repr_type_being_used):
             binaryloss = nn.BCELoss()
+            binary_flag_loss_weight = opt.binary_flag_loss_weight
 
             self.decoder_recoloss = lambda p, t:\
                 reco_alongside_one_bit_flag_loss(recoloss, binaryloss, p, t,
-                recoweight=1.0, binaryweight=1.0)
+                recoweight=1.0, binaryweight=binary_flag_loss_weight)
 
         elif loop_repr_type_being_used == loop_reprs.LOOP_REPR_ELLIPSE_SINGLE:
             self.decoder_recoloss = recoloss
@@ -1040,15 +1237,24 @@ class LoopSeqEncoderDecoderModel():
         _kl_annealing_R = 0.9999
         _kl_annealing_formula_sketchrnn = (lambda _: 1.0) if ((opt.enc_kl_weight == 0.0) or (self.kl_annealing_cycle < 0)) else \
             (lambda curr_iter: 1.0-(1.0-opt.enc_kl_min)*(_kl_annealing_R ** curr_iter))
-        self.kl_annealing_formula = _kl_annealing_formula_sketchrnn
+        if opt.enc_kl_anneal_formula == 'ramp':
+            self.kl_annealing_formula = _kl_annealing_formula_sketchrnn
+        elif opt.enc_kl_anneal_formula == 'cyclic':
+            self.kl_annealing_formula = _kl_annealing_formula_cyclic
+        else:
+            thlog.err("Unknown --kl_annealing_formula type, setting to constant function.")
+            self.kl_annealing_formula = (lambda _: 1.0)
 
         # initialize optimizer first, if training:
         if self.is_train:
-            DEFAULT_BETA1 = 0.9
-            self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(),
-                lr=opt.lr, betas=(DEFAULT_BETA1, 0.999))
-            self.decoder_optimizer = torch.optim.Adam(self.decoder.parameters(),
-                lr=opt.lr, betas=(DEFAULT_BETA1, 0.999))
+            if opt.optimizer == "adamw":
+                self.encoder_optimizer = torch.optim.AdamW(self.encoder.parameters(),lr=opt.lr)
+                self.decoder_optimizer = torch.optim.AdamW(self.decoder.parameters(),lr=opt.lr)
+            elif opt.optimizer == "adam":
+                self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(),lr=opt.lr, betas=(0.9, 0.999))
+                self.decoder_optimizer = torch.optim.Adam(self.decoder.parameters(),lr=opt.lr, betas=(0.9, 0.999))
+            else:
+                raise ValueError("unknown optimizer type")
         
         # then load network states and optimizer states, if load_epoch is specified
         if loop_opts.has_field(self.opt, 'load_epoch'):
@@ -1066,8 +1272,8 @@ class LoopSeqEncoderDecoderModel():
                 lr_l = 1.0 - max(0, epoch + 1 + start_epoch_num - opt.niter) / float(opt.niter_decay + 1)
                 return lr_l
             scheduler_last_epoch = self.opt.count_from_epoch if loop_opts.has_field(self.opt, 'count_from_epoch') else (-1)
-            self.encoder_scheduler = torch.optim.lr_scheduler.LambdaLR(self.encoder_optimizer, lr_lambda=lambda_rule, last_epoch=scheduler_last_epoch)
-            self.decoder_scheduler = torch.optim.lr_scheduler.LambdaLR(self.decoder_optimizer, lr_lambda=lambda_rule, last_epoch=scheduler_last_epoch)
+            self.encoder_scheduler: torch.optim.lr_scheduler.LRScheduler = torch.optim.lr_scheduler.LambdaLR(self.encoder_optimizer, lr_lambda=lambda_rule, last_epoch=scheduler_last_epoch)
+            self.decoder_scheduler: torch.optim.lr_scheduler.LRScheduler = torch.optim.lr_scheduler.LambdaLR(self.decoder_optimizer, lr_lambda=lambda_rule, last_epoch=scheduler_last_epoch)
             #self.encoder_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.encoder_optimizer, factor=0.8, patience=10, threshold=0.0001, threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08, verbose=True)
             #self.decoder_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.decoder_optimizer, factor=0.8, patience=10, threshold=0.0001, threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08, verbose=True)
         
@@ -1091,16 +1297,17 @@ class LoopSeqEncoderDecoderModel():
             thlog.info("dry run, not saving")
             return
         
-        for (curr_module, fname_format, is_nn_module) in \
-            ((self.encoder, 'enc{}_net.pth', True), (self.decoder, 'dec{}_net.pth', True), 
-             (self.encoder_optimizer, 'enc{}_optimizer.pth', False), (self.decoder_optimizer, 'dec{}_optimizer.pth', False)):
+        for (curr_module, fname_format) in \
+            ((self.encoder, 'enc{}_net.pth'), (self.decoder, 'dec{}_net.pth'), 
+             (self.encoder_optimizer, 'enc{}_optimizer.pth'), (self.decoder_optimizer, 'dec{}_optimizer.pth')):
+            
             save_filename = fname_format.format(which_epoch)
             save_path = os.path.join(self.save_dir, save_filename)
-            if self.gpu_ids and torch.cuda.is_available() and is_nn_module:
-                torch.save(curr_module.module.cpu().state_dict(), save_path)
+            if self.gpu_ids and torch.cuda.is_available() and isinstance(curr_module, nn.Module):
+                torch.save(curr_module.module.cpu().state_dict(), save_path) # type: ignore
                 curr_module.cuda(self.gpu_ids[0])
             else:
-                if is_nn_module:
+                if isinstance(curr_module, nn.Module):
                     torch.save(curr_module.cpu().state_dict(), save_path)
                 else:
                     # optimizers don't have a .cpu() method 
@@ -1146,7 +1353,7 @@ class LoopSeqEncoderDecoderModel():
                 thlog.info(f"{fnameprefix} optimizer state also exists: loaded with LR {optimizer.param_groups[0]['lr']}")
 
     
-    def write_loss_log(self, epoch_num:int, loss_vals:tuple, is_test:bool):
+    def write_loss_log(self, epoch_num:int, loss_vals: Sequence[float], is_test:bool):
         """ Save multiple sublosses and total loss"""
         if self.dry_run:
             return
@@ -1159,13 +1366,14 @@ class LoopSeqEncoderDecoderModel():
             # csv format: epoch,reco loss,klloss(,and more if there are any)
             f.write(f'{epoch_num},{",".join(map(str,loss_vals))}\n')
 
-    def update_learning_rate(self, losses:tuple=None):
+    def update_learning_rate(self, losses: Optional[Tuple[float, float]]=None):
         """update learning rate (called once every epoch)"""
         if isinstance(self.encoder_scheduler, 
             torch.optim.lr_scheduler.ReduceLROnPlateau):
+            assert losses is not None
             # loss tuple is (decoder reco loss, encoder KL loss)
-            self.encoder_scheduler.step(losses[1])
-            self.decoder_scheduler.step(losses[0])
+            self.encoder_scheduler.step(losses[1])  # type: ignore
+            self.decoder_scheduler.step(losses[0])  # type: ignore
         else:    
             self.encoder_scheduler.step()
             self.decoder_scheduler.step()
@@ -1212,9 +1420,9 @@ class LoopSeqEncoderDecoderModel():
         that takes 1 argument: the timestep data of shape (1, features), and
         returns a (modified) timestep of the same shape.
         """
-        if self.opt.architecture != "transformer":
+        if not architecture_type_has_a_transformer_decoder(self.opt.architecture):
             raise ValueError("attempting to call a transformer inference function"
-            "but the architecture is not set to `transformer`.")
+            "but the architecture does not have a transformer decoder")
         
         # each ts is of shape (batch, features); we want to sigmoid the last
         # feature, because our model doesn't do that, the loss does...
@@ -1237,7 +1445,7 @@ class LoopSeqEncoderDecoderModel():
             self.to_gpu_tensor(latent_z), 
             n_time_steps, 
             fn_after_each_timestep=__maybe_compose(
-                fn_after_each_timestep, sigmoiding_after_each_timestep))
+                fn_after_each_timestep, sigmoiding_after_each_timestep)) # type: ignore
             
         
 
@@ -1249,7 +1457,13 @@ class LoopSeqEncoderDecoderModel():
             decoder_target is not None else None
         # first pipe input seq througuh the encoder to get a sampled z and the
         # predicted mu, sig
-        sampled_z, pred_mu, pred_log_of_sigma_squared = self.encoder(input_seq[1:], input_mask_timesteps_that_are_zero[1:])
+        if ("pointnet" in self.opt.architecture):
+            input_pcloud = data_item.get('pcloud')
+            assert input_pcloud is not None, "pointnet architecture but the dataset did not load any point clouds"
+            input_pcloud = self.to_gpu_tensor(input_pcloud)
+            sampled_z, pred_mu, pred_log_of_sigma_squared = self.encoder(input_pcloud)
+        else:
+            sampled_z, pred_mu, pred_log_of_sigma_squared = self.encoder(input_seq[1:], input_mask_timesteps_that_are_zero[1:])
         # ^^ that is [1:] because we can throw away the dummy all-zeroes
         # operation at the start, since the encoder doesn't have to give
         # predictions of the next token
@@ -1265,9 +1479,13 @@ class LoopSeqEncoderDecoderModel():
         # then make a prediction / reconstruction with the decoder
         
         if self.opt.architecture == "lstm" or self.opt.architecture == "lstm+transformer":
+            # NOTE 2023-04-06 despite the name, lstm+transformer uses an lstm as a decoder, not encoder.
             third_decoder_argument = prev_decoder_states
-        elif self.opt.architecture == "transformer":
+        elif architecture_type_has_a_transformer_decoder(self.opt.architecture):
+            # NOTE 2023-04-06 pointnet+transformer uses a pointnet as an encoder, and transformer as a decoder.
             third_decoder_argument = input_mask_timesteps_that_are_zero[:-1]
+        else:
+            raise ValueError("architecture not supported")
 
         # NOTE input_seq[-1] because now the dataset will provide
         # the entire sequence from the 0-dummy-step to the last timestep, rather
@@ -1319,7 +1537,7 @@ class LoopSeqEncoderDecoderModel():
 def dataset_cache_gen_main():
     thlog.info("loop_models running as main, will be doing DATASET CACHE GENERATION.")
     opt = loop_opts.LoopSeqOptions().parse_cmdline()
-    assert opt.mode in ('train', 'test')
+    assert opt and opt.mode in ('train', 'test')
     train_dataset = LoopSeqDataset(opt, override_mode=opt.mode, regenerate_cache=True)
     thlog.info("Dataset cache generation done.")
 
